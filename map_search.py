@@ -54,23 +54,23 @@ num_points = len(list(G))
 # Create a dictionary of adjacent node for efficient look-up.
 adj_dict = {n: adjacent_node_dict for n, adjacent_node_dict in G.adjacency()}
 
-
  # Create a dictionary to map nodes to their index in a list
 node_index_map = {nodes[i]: i for i in range(num_points)}
+
+# Initially set sizes and colours to defaults (size 10, colour white)
+sizes = [10 for i in range(num_points)]
+colours = ["#FFFFFF" for i in range(num_points)] 
 
 def update_graph_visuals(current_node, closed_set):
     '''
     Function to update the sizes and colours of the nodes in the graph.
     '''
 
-    # Initially set sizes and colours to defaults (size 10, colour white)
-    sizes = [10 for i in range(num_points)]
-    colours = ["#FFFFFF" for i in range(num_points)] 
-
+    
     # Loop through all closed (visited) nodes and set them to yellow and size 10
-    if len(closed_set) > 0:
-        sizes[node_index_map[closed_set[-1]]] = 10
-        colours[node_index_map[closed_set[-1]]] = "#FFFF00"
+    if len(closed_set) > 1:
+        sizes[node_index_map[closed_set[-2]]] = 10
+        colours[node_index_map[closed_set[-2]]] = "#FFFF00"
 
     # Set destination node to size 30 and to purple colour 
     colours[node_index_map[dest]] = "#FF00FF"
@@ -86,35 +86,58 @@ def update_graph_visuals(current_node, closed_set):
 
     return scatter
 
-closed = []
-open = [start]
-done = False
+class SearchClass:
+    def __init__(self, start_node, destination_node):
+        self.start = start_node
+        self.destination = destination_node
+        self.done = False
+        self.open = [start_node]
+        self.closed = []
 
+    def reset(self):
+        self.done = False
+        self.open = [self.start]
+        self.closed = []
 
-def search():
-    global done
+    def search_step(self, type="bfs"):
+        match type:
+            case "bfs":
+                return self.depth_first_step()
+            case "dfs":
+                return self.breadth_first_step()
 
-    if done: return 
+    def depth_first_step(self):
+        if self.done: return self.destination
+        node = self.open.pop(-1)
+        self.done = (node == self.destination)
+        self.open.extend([key for key in adj_dict[node].keys() if key not in self.closed])
+        self.closed.append(node)
 
-    node = open.pop(0)
+        return node
     
-    done = (node == dest)
+    def breadth_first_step(self):
+        if self.done: return self.destination
+        node = self.open.pop(-1)
+        self.done = (node == self.destination)
+        self.open.extend([key for key in adj_dict[node].keys() if key not in self.closed])
+        self.closed.append(node)
 
-    open.extend([key for key in adj_dict[node].keys() if key not in closed])
+        return node
 
-    closed.append(node)
 
-    return node
+searcher = SearchClass(start, dest)
+search_type = "dfs"
+
 
 # Animation function
 def animate(frame):
-    next_node = search()
-    update_graph_visuals(next_node, closed)
+    next_node = searcher.search_step(type=search_type)
+    update_graph_visuals(next_node, searcher.closed)
     return scatter
 
 # Create the animation
-ani = FuncAnimation(fig, animate, frames=10, interval=200)
+ani = FuncAnimation(fig, animate, frames=num_points, interval=200)
 
-HTML(ani.to_jshtml())
-# ani.save("bfs_manchester.mp4")
+ani.save(search_type + "_manchester.mp4")
+
 
