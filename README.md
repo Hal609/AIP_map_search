@@ -6,7 +6,7 @@
 | Breadth-First Search (**BFS**) | ✅ |
 | Depth-First Search (**DFS**) | ✅ |
 | Uniform Cost Search (**UCS**) | 🟡 |
-| A Search (**A\***) | ❌ |
+| A Search (**A\***) | ✅ |
 
 ## 2. Tree Search and Graph Search
 
@@ -14,8 +14,8 @@
 - Graph Search: Use a closed set to track visited nodes and avoid revisiting. ✅
 - Record the following for each version:
     - Path found ✅
-    - Time elapsed
-    - Path cost
+    - Time elapsed ✅
+    - Path cost ✅
 
 
 ##  3. Path Visualisation ✅
@@ -38,13 +38,12 @@
     - Path cost.
     - Memory/storage usage.
 
-| Algorithm | Time (s) | Path Length | Path Cost | Memory Usage | 
-| --------- | -------- | ----------- | --------- |------------- |
-| BFS       |          |             |           |              | 
-| DFS       |          |             |           |              | 
-| UCS       |          |             |           |              | 
-| A*        |          |             |           |              | 
-
+| Algorithm |  Time (ms)  | Path Length | Path Cost | Memory Usage | 
+| --------- | ----------- | ----------- | --------- |------------- |
+| BFS       | 10828.48228 |             |           |              | 
+| DFS       | 462.78136   |             |           |              | 
+| UCS       |             |             |           |              | 
+| A*        | 1.87983     |             |           |              |    
 
 ## 5. Code Formatting and Structure
 
