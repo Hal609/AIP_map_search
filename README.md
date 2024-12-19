@@ -5,7 +5,7 @@
 | ------------- | ------------- |
 | Breadth-First Search (**BFS**) | ✅ |
 | Depth-First Search (**DFS**) | ✅ |
-| Uniform Cost Search (**UCS**) | 🟡 |
+| Uniform Cost Search (**UCS**) | ✅ |
 | A Search (**A\***) | ✅ |
 
 ## 2. Tree Search and Graph Search
