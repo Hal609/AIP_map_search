@@ -49,5 +49,5 @@
 
 - Fully comment and document the code. 🟡
 - Describe the function of the algorithms in docstrings.
-- Make the visuals pretty. 🟡
+- Make the visuals pretty. ✅
 - Write a proper README.
