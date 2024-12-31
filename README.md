@@ -12,6 +12,7 @@
 
 - Tree Search: Explore all nodes without checking if a node has been visited before.
 - Graph Search: Use a closed set to track visited nodes and avoid revisiting. ✅
+- If a node is already visited, check if a faster path to the node has been found and update accordingly.
 - Record the following for each version:
     - Path found ✅
     - Time elapsed ✅
@@ -30,10 +31,10 @@
 
 ## 4. Compare Algorithms
 
-- Run several searches (without visualisation) and log the time and memory used. 🟡
-- Graph the time and space complexity of the algorithms 
+- Run several searches (without visualisation) and log: the time ✅ and memory ❌ used. 
+- Graph the time and space complexity of the algorithms ✅
 - Create a comparison table with the following metrics:
-    - Time taken to compute the path.
+    - Time taken to compute the path. ✅
     - Path length (number of moves).
     - Path cost.
     - Memory/storage usage.
