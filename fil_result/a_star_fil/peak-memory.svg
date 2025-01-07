@@ -1,0 +1,1918 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1200" height="1072" onload="init(evt)" viewBox="0 0 1200 1072" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fg="http://github.com/jonhoo/inferno">
+    <!--Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples.-->
+    <!--NOTES: -->
+    <defs>
+        <linearGradient id="background" y1="0" y2="1" x1="0" x2="0">
+            <stop stop-color="#eeeeee" offset="5%"/>
+            <stop stop-color="#eeeeb0" offset="95%"/>
+        </linearGradient>
+    </defs>
+    <style type="text/css">
+text { font-family:monospace; font-size:16px }
+#title { text-anchor:middle; font-size:21px; }
+#matched { text-anchor:end; }
+#search { text-anchor:end; opacity:0.1; cursor:pointer; }
+#search:hover, #search.show { opacity:1; }
+#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+#unzoom { cursor:pointer; }
+#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+.hide { display:none; }
+.parent { opacity:0.5; }
+</style>
+    <script type="text/ecmascript"><![CDATA[
+        var nametype = 'Function:';
+        var fontsize = 16;
+        var fontwidth = 0.59;
+        var xpad = 10;
+        var inverted = true;
+        var searchcolor = 'rgb(230,0,230)';
+        var fluiddrawing = true;
+        var truncate_text_right = false;
+    ]]><![CDATA["use strict";
+var details, searchbtn, unzoombtn, matchedtxt, svg, searching, frames, known_font_width;
+function init(evt) {
+    details = document.getElementById("details").firstChild;
+    searchbtn = document.getElementById("search");
+    unzoombtn = document.getElementById("unzoom");
+    matchedtxt = document.getElementById("matched");
+    svg = document.getElementsByTagName("svg")[0];
+    frames = document.getElementById("frames");
+    known_font_width = get_monospace_width(frames);
+    total_samples = parseInt(frames.attributes.total_samples.value);
+    searching = 0;
+
+    // Use GET parameters to restore a flamegraph's state.
+    var restore_state = function() {
+        var params = get_params();
+        if (params.x && params.y)
+            zoom(find_group(document.querySelector('[*|x="' + params.x + '"][y="' + params.y + '"]')));
+        if (params.s)
+            search(params.s);
+    };
+
+    if (fluiddrawing) {
+        // Make width dynamic so the SVG fits its parent's width.
+        svg.removeAttribute("width");
+        // Edge requires us to have a viewBox that gets updated with size changes.
+        var isEdge = /Edge\/\d./i.test(navigator.userAgent);
+        if (!isEdge) {
+            svg.removeAttribute("viewBox");
+        }
+        var update_for_width_change = function() {
+            if (isEdge) {
+                svg.attributes.viewBox.value = "0 0 " + svg.width.baseVal.value + " " + svg.height.baseVal.value;
+            }
+
+            // Keep consistent padding on left and right of frames container.
+            frames.attributes.width.value = svg.width.baseVal.value - xpad * 2;
+
+            // Text truncation needs to be adjusted for the current width.
+            update_text_for_elements(frames.children);
+
+            // Keep search elements at a fixed distance from right edge.
+            var svgWidth = svg.width.baseVal.value;
+            searchbtn.attributes.x.value = svgWidth - xpad;
+            matchedtxt.attributes.x.value = svgWidth - xpad;
+        };
+        window.addEventListener('resize', function() {
+            update_for_width_change();
+        });
+        // This needs to be done asynchronously for Safari to work.
+        setTimeout(function() {
+            unzoom();
+            update_for_width_change();
+            restore_state();
+        }, 0);
+    } else {
+        restore_state();
+    }
+}
+// event listeners
+window.addEventListener("click", function(e) {
+    var target = find_group(e.target);
+    if (target) {
+        if (target.nodeName == "a") {
+            if (e.ctrlKey === false) return;
+            e.preventDefault();
+        }
+        if (target.classList.contains("parent")) unzoom();
+        zoom(target);
+
+        // set parameters for zoom state
+        var el = target.querySelector("rect");
+        if (el && el.attributes && el.attributes.y && el.attributes["fg:x"]) {
+            var params = get_params()
+            params.x = el.attributes["fg:x"].value;
+            params.y = el.attributes.y.value;
+            history.replaceState(null, null, parse_params(params));
+        }
+    }
+    else if (e.target.id == "unzoom") {
+        unzoom();
+
+        // remove zoom state
+        var params = get_params();
+        if (params.x) delete params.x;
+        if (params.y) delete params.y;
+        history.replaceState(null, null, parse_params(params));
+    }
+    else if (e.target.id == "search") search_prompt();
+}, false)
+// mouse-over for info
+// show
+window.addEventListener("mouseover", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = nametype + " " + g_to_text(target);
+}, false)
+// clear
+window.addEventListener("mouseout", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = ' ';
+}, false)
+// ctrl-F for search
+window.addEventListener("keydown",function (e) {
+    if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+        e.preventDefault();
+        search_prompt();
+    }
+}, false)
+// functions
+function get_params() {
+    var params = {};
+    var paramsarr = window.location.search.substr(1).split('&');
+    for (var i = 0; i < paramsarr.length; ++i) {
+        var tmp = paramsarr[i].split("=");
+        if (!tmp[0] || !tmp[1]) continue;
+        params[tmp[0]]  = decodeURIComponent(tmp[1]);
+    }
+    return params;
+}
+function parse_params(params) {
+    var uri = "?";
+    for (var key in params) {
+        uri += key + '=' + encodeURIComponent(params[key]) + '&';
+    }
+    if (uri.slice(-1) == "&")
+        uri = uri.substring(0, uri.length - 1);
+    if (uri == '?')
+        uri = window.location.href.split('?')[0];
+    return uri;
+}
+function find_child(node, selector) {
+    var children = node.querySelectorAll(selector);
+    if (children.length) return children[0];
+    return;
+}
+function find_group(node) {
+    var parent = node.parentElement;
+    if (!parent) return;
+    if (parent.id == "frames") return node;
+    return find_group(parent);
+}
+function orig_save(e, attr, val) {
+    if (e.attributes["fg:orig_" + attr] != undefined) return;
+    if (e.attributes[attr] == undefined) return;
+    if (val == undefined) val = e.attributes[attr].value;
+    e.setAttribute("fg:orig_" + attr, val);
+}
+function orig_load(e, attr) {
+    if (e.attributes["fg:orig_"+attr] == undefined) return;
+    e.attributes[attr].value = e.attributes["fg:orig_" + attr].value;
+    e.removeAttribute("fg:orig_" + attr);
+}
+function g_to_text(e) {
+    var text = find_child(e, "title").firstChild.nodeValue;
+    return (text)
+}
+function g_to_func(e) {
+    var func = g_to_text(e);
+    // if there's any manipulation we want to do to the function
+    // name before it's searched, do it here before returning.
+    return (func);
+}
+function get_monospace_width(frames) {
+    // Given the id="frames" element, return the width of text characters if
+    // this is a monospace font, otherwise return 0.
+    text = find_child(frames.children[0], "text");
+    originalContent = text.textContent;
+    text.textContent = "!";
+    bangWidth = text.getComputedTextLength();
+    text.textContent = "W";
+    wWidth = text.getComputedTextLength();
+    text.textContent = originalContent;
+    if (bangWidth === wWidth) {
+        return bangWidth;
+    } else {
+        return 0;
+    }
+}
+function update_text_for_elements(elements) {
+    // In order to render quickly in the browser, you want to do one pass of
+    // reading attributes, and one pass of mutating attributes. See
+    // https://web.dev/avoid-large-complex-layouts-and-layout-thrashing/ for details.
+
+    // Fall back to inefficient calculation, if we're variable-width font.
+    // TODO This should be optimized somehow too.
+    if (known_font_width === 0) {
+        for (var i = 0; i < elements.length; i++) {
+            update_text(elements[i]);
+        }
+        return;
+    }
+
+    var textElemNewAttributes = [];
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var r = find_child(e, "rect");
+        var t = find_child(e, "text");
+        var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+        var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+        var newX = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+        // Smaller than this size won't fit anything
+        if (w < 2 * known_font_width) {
+            textElemNewAttributes.push([newX, ""]);
+            continue;
+        }
+
+        // Fit in full text width
+        if (txt.length * known_font_width < w) {
+            textElemNewAttributes.push([newX, txt]);
+            continue;
+        }
+
+        var substringLength = Math.floor(w / known_font_width) - 2;
+        if (truncate_text_right) {
+            // Truncate the right side of the text.
+            textElemNewAttributes.push([newX, txt.substring(0, substringLength) + ".."]);
+            continue;
+        } else {
+            // Truncate the left side of the text.
+            textElemNewAttributes.push([newX, ".." + txt.substring(txt.length - substringLength, txt.length)]);
+            continue;
+        }
+    }
+
+    console.assert(textElemNewAttributes.length === elements.length, "Resize failed, please file a bug at https://github.com/jonhoo/inferno/");
+
+    // Now that we know new textContent, set it all in one go so we don't refresh a bazillion times.
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var values = textElemNewAttributes[i];
+        var t = find_child(e, "text");
+        t.attributes.x.value = values[0];
+        t.textContent = values[1];
+    }
+}
+
+function update_text(e) {
+    var r = find_child(e, "rect");
+    var t = find_child(e, "text");
+    var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+    var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+    t.attributes.x.value = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+    // Smaller than this size won't fit anything
+    if (w < 2 * fontsize * fontwidth) {
+        t.textContent = "";
+        return;
+    }
+    t.textContent = txt;
+    // Fit in full text width
+    if (t.getComputedTextLength() < w)
+        return;
+    if (truncate_text_right) {
+        // Truncate the right side of the text.
+        for (var x = txt.length - 2; x > 0; x--) {
+            if (t.getSubStringLength(0, x + 2) <= w) {
+                t.textContent = txt.substring(0, x) + "..";
+                return;
+            }
+        }
+    } else {
+        // Truncate the left side of the text.
+        for (var x = 2; x < txt.length; x++) {
+            if (t.getSubStringLength(x - 2, txt.length) <= w) {
+                t.textContent = ".." + txt.substring(x, txt.length);
+                return;
+            }
+        }
+    }
+    t.textContent = "";
+}
+// zoom
+function zoom_reset(e) {
+    if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * parseInt(e.attributes["fg:x"].value) / total_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / total_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_reset(c[i]);
+    }
+}
+function zoom_child(e, x, zoomed_width_samples) {
+    if (e.tagName == "text") {
+        var parent_x = parseFloat(find_child(e.parentNode, "rect[x]").attributes.x.value);
+        e.attributes.x.value = format_percent(parent_x + (100 * 3 / frames.attributes.width.value));
+    } else if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * (parseInt(e.attributes["fg:x"].value) - x) / zoomed_width_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / zoomed_width_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_child(c[i], x, zoomed_width_samples);
+    }
+}
+function zoom_parent(e) {
+    if (e.attributes) {
+        if (e.attributes.x != undefined) {
+            e.attributes.x.value = "0.0%";
+        }
+        if (e.attributes.width != undefined) {
+            e.attributes.width.value = "100.0%";
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_parent(c[i]);
+    }
+}
+function zoom(node) {
+    var attr = find_child(node, "rect").attributes;
+    var width = parseInt(attr["fg:w"].value);
+    var xmin = parseInt(attr["fg:x"].value);
+    var xmax = xmin + width;
+    var ymin = parseFloat(attr.y.value);
+    unzoombtn.classList.remove("hide");
+    var el = frames.children;
+    var to_update_text = [];
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var a = find_child(e, "rect").attributes;
+        var ex = parseInt(a["fg:x"].value);
+        var ew = parseInt(a["fg:w"].value);
+        // Is it an ancestor
+        if (!inverted) {
+            var upstack = parseFloat(a.y.value) > ymin;
+        } else {
+            var upstack = parseFloat(a.y.value) < ymin;
+        }
+        if (upstack) {
+            // Direct ancestor
+            if (ex <= xmin && (ex+ew) >= xmax) {
+                e.classList.add("parent");
+                zoom_parent(e);
+                to_update_text.push(e);
+            }
+            // not in current path
+            else
+                e.classList.add("hide");
+        }
+        // Children maybe
+        else {
+            // no common path
+            if (ex < xmin || ex >= xmax) {
+                e.classList.add("hide");
+            }
+            else {
+                zoom_child(e, xmin, width);
+                to_update_text.push(e);
+            }
+        }
+    }
+    update_text_for_elements(to_update_text);
+}
+function unzoom() {
+    unzoombtn.classList.add("hide");
+    var el = frames.children;
+    for(var i = 0; i < el.length; i++) {
+        el[i].classList.remove("parent");
+        el[i].classList.remove("hide");
+        zoom_reset(el[i]);
+    }
+    update_text_for_elements(el);
+}
+// search
+function reset_search() {
+    var el = document.querySelectorAll("#frames rect");
+    for (var i = 0; i < el.length; i++) {
+        orig_load(el[i], "fill")
+    }
+    var params = get_params();
+    delete params.s;
+    history.replaceState(null, null, parse_params(params));
+}
+function search_prompt() {
+    if (!searching) {
+        var term = prompt("Enter a search term (regexp " +
+            "allowed, eg: ^ext4_)", "");
+        if (term != null) {
+            search(term)
+        }
+    } else {
+        reset_search();
+        searching = 0;
+        searchbtn.classList.remove("show");
+        searchbtn.firstChild.nodeValue = "Search"
+        matchedtxt.classList.add("hide");
+        matchedtxt.firstChild.nodeValue = ""
+    }
+}
+function search(term) {
+    var re = new RegExp(term);
+    var el = frames.children;
+    var matches = new Object();
+    var maxwidth = 0;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        // Skip over frames which are either not visible, or below the zoomed-to frame
+        if (e.classList.contains("hide") || e.classList.contains("parent")) {
+            continue;
+        }
+        var func = g_to_func(e);
+        var rect = find_child(e, "rect");
+        if (func == null || rect == null)
+            continue;
+        // Save max width. Only works as we have a root frame
+        var w = parseInt(rect.attributes["fg:w"].value);
+        if (w > maxwidth)
+            maxwidth = w;
+        if (func.match(re)) {
+            // highlight
+            var x = parseInt(rect.attributes["fg:x"].value);
+            orig_save(rect, "fill");
+            rect.attributes.fill.value = searchcolor;
+            // remember matches
+            if (matches[x] == undefined) {
+                matches[x] = w;
+            } else {
+                if (w > matches[x]) {
+                    // overwrite with parent
+                    matches[x] = w;
+                }
+            }
+            searching = 1;
+        }
+    }
+    if (!searching)
+        return;
+    var params = get_params();
+    params.s = term;
+    history.replaceState(null, null, parse_params(params));
+
+    searchbtn.classList.add("show");
+    searchbtn.firstChild.nodeValue = "Reset Search";
+    // calculate percent matched, excluding vertical overlap
+    var count = 0;
+    var lastx = -1;
+    var lastw = 0;
+    var keys = Array();
+    for (k in matches) {
+        if (matches.hasOwnProperty(k))
+            keys.push(k);
+    }
+    // sort the matched frames by their x location
+    // ascending, then width descending
+    keys.sort(function(a, b){
+        return a - b;
+    });
+    // Step through frames saving only the biggest bottom-up frames
+    // thanks to the sort order. This relies on the tree property
+    // where children are always smaller than their parents.
+    for (var k in keys) {
+        var x = parseInt(keys[k]);
+        var w = matches[keys[k]];
+        if (x >= lastx + lastw) {
+            count += w;
+            lastx = x;
+            lastw = w;
+        }
+    }
+    // display matched percent
+    matchedtxt.classList.remove("hide");
+    var pct = 100 * count / maxwidth;
+    if (pct != 100) pct = pct.toFixed(1);
+    matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+}
+function format_percent(n) {
+    return n.toFixed(4) + "%";
+}
+]]></script>
+    <rect x="0" y="0" width="100%" height="1072" fill="url(#background)"/>
+    <text id="title" fill="rgb(0,0,0)" x="50.0000%" y="32.00">Peak Tracked Memory Usage (2.5 MiB)</text>
+    <text id="subtitle" x="50.0000%" y="64.00">Made with the Fil profiler. <a href="https://pythonspeed.com/fil/" style="text-decoration: underline;" target="_parent">Try it on your code!</a></text>
+    <text id="details" fill="rgb(0,0,0)" x="10" y="84.00"> </text>
+    <text id="unzoom" class="hide" fill="rgb(0,0,0)" x="10" y="32.00">Reset Zoom</text>
+    <text id="search" fill="rgb(0,0,0)" x="1190" y="32.00">Search</text>
+    <text id="matched" fill="rgb(0,0,0)" x="1190" y="1059.00"> </text>
+    <svg id="frames" x="10" width="1180" total_samples="2635621">
+        <g>
+            <title>/Users/hal/Library/CloudStorage/OneDrive-MMU/Documents/AI_Principles/map_search/search_map_dfs.py:122 (search_step) (670,488 bytes, 25.44%)</title>
+            <rect x="0.1909%" y="210" width="25.4395%" height="21" fill="rgb(255,174,174)" fg:x="5032" fg:w="670488"/>
+            <text x="0.4409%" y="223.50">/Users/hal/Library/CloudStorag..</text>
+        </g>
+        <g>
+            <title>            [Node(node_id, (670,488 bytes, 25.44%)</title>
+            <rect x="0.1909%" y="232" width="25.4395%" height="21" fill="rgb(255,174,174)" fg:x="5032" fg:w="670488"/>
+            <text x="0.4409%" y="245.50">            [Node(node_id,..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:897 (levels) (11,690 bytes, 0.44%)</title>
+            <rect x="31.6698%" y="518" width="0.4435%" height="21" fill="rgb(255,240,240)" fg:x="834696" fg:w="11690"/>
+            <text x="31.9198%" y="531.50"></text>
+        </g>
+        <g>
+            <title>        result = [x._rename(name=name) for x, name in zip(self._levels, self._names)] (11,690 bytes, 0.44%)</title>
+            <rect x="31.6698%" y="540" width="0.4435%" height="21" fill="rgb(255,240,240)" fg:x="834696" fg:w="11690"/>
+            <text x="31.9198%" y="553.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/base.py:787 (_rename) (11,462 bytes, 0.43%)</title>
+            <rect x="31.6785%" y="562" width="0.4349%" height="21" fill="rgb(255,240,240)" fg:x="834924" fg:w="11462"/>
+            <text x="31.9285%" y="575.50"></text>
+        </g>
+        <g>
+            <title>        result = self._view() (11,462 bytes, 0.43%)</title>
+            <rect x="31.6785%" y="584" width="0.4349%" height="21" fill="rgb(255,240,240)" fg:x="834924" fg:w="11462"/>
+            <text x="31.9285%" y="597.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/base.py:777 (_view) (11,072 bytes, 0.42%)</title>
+            <rect x="31.6933%" y="606" width="0.4201%" height="21" fill="rgb(255,240,240)" fg:x="835314" fg:w="11072"/>
+            <text x="31.9433%" y="619.50"></text>
+        </g>
+        <g>
+            <title>        result = self._simple_new(self._values, name=self._name, refs=self._references) (11,072 bytes, 0.42%)</title>
+            <rect x="31.6933%" y="628" width="0.4201%" height="21" fill="rgb(255,240,240)" fg:x="835314" fg:w="11072"/>
+            <text x="31.9433%" y="641.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/base.py:670 (_simple_new) (10,160 bytes, 0.39%)</title>
+            <rect x="31.7279%" y="650" width="0.3855%" height="21" fill="rgb(255,240,240)" fg:x="836226" fg:w="10160"/>
+            <text x="31.9779%" y="663.50"></text>
+        </g>
+        <g>
+            <title>        result._references.add_index_reference(result) (10,160 bytes, 0.39%)</title>
+            <rect x="31.7279%" y="672" width="0.3855%" height="21" fill="rgb(255,240,240)" fg:x="836226" fg:w="10160"/>
+            <text x="31.9779%" y="685.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:3316 (_get_level_indexer) (11,882 bytes, 0.45%)</title>
+            <rect x="31.6698%" y="474" width="0.4508%" height="21" fill="rgb(255,239,239)" fg:x="834696" fg:w="11882"/>
+            <text x="31.9198%" y="487.50"></text>
+        </g>
+        <g>
+            <title>        level_index = self.levels[level] (11,882 bytes, 0.45%)</title>
+            <rect x="31.6698%" y="496" width="0.4508%" height="21" fill="rgb(255,239,239)" fg:x="834696" fg:w="11882"/>
+            <text x="31.9198%" y="509.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/base.py:3805 (get_loc) (532,136 bytes, 20.19%)</title>
+            <rect x="32.1546%" y="562" width="20.1902%" height="21" fill="rgb(255,182,182)" fg:x="847474" fg:w="532136"/>
+            <text x="32.4046%" y="575.50">/Users/hal/miniforge3/l..</text>
+        </g>
+        <g>
+            <title>            return self._engine.get_loc(casted_key) (532,136 bytes, 20.19%)</title>
+            <rect x="32.1546%" y="584" width="20.1902%" height="21" fill="rgb(255,182,182)" fg:x="847474" fg:w="532136"/>
+            <text x="32.4046%" y="597.50">            return sel..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:2980 (_get_loc_single_level_index) (533,492 bytes, 20.24%)</title>
+            <rect x="32.1546%" y="518" width="20.2416%" height="21" fill="rgb(255,182,182)" fg:x="847474" fg:w="533492"/>
+            <text x="32.4046%" y="531.50">/Users/hal/miniforge3/l..</text>
+        </g>
+        <g>
+            <title>            return level_index.get_loc(key) (533,492 bytes, 20.24%)</title>
+            <rect x="32.1546%" y="540" width="20.2416%" height="21" fill="rgb(255,182,182)" fg:x="847474" fg:w="533492"/>
+            <text x="32.4046%" y="553.50">            return lev..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:3391 (_get_level_indexer) (534,820 bytes, 20.29%)</title>
+            <rect x="32.1206%" y="474" width="20.2920%" height="21" fill="rgb(255,182,182)" fg:x="846578" fg:w="534820"/>
+            <text x="32.3706%" y="487.50">/Users/hal/miniforge3/l..</text>
+        </g>
+        <g>
+            <title>            idx = self._get_loc_single_level_index(level_index, key) (534,820 bytes, 20.29%)</title>
+            <rect x="32.1206%" y="496" width="20.2920%" height="21" fill="rgb(255,182,182)" fg:x="846578" fg:w="534820"/>
+            <text x="32.3706%" y="509.50">            idx = self..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:2014 (_lexsort_depth) (16,932 bytes, 0.64%)</title>
+            <rect x="52.4126%" y="518" width="0.6424%" height="21" fill="rgb(255,238,238)" fg:x="1381398" fg:w="16932"/>
+            <text x="52.6626%" y="531.50"></text>
+        </g>
+        <g>
+            <title>        return _lexsort_depth(self.codes, self.nlevels) (16,932 bytes, 0.64%)</title>
+            <rect x="52.4126%" y="540" width="0.6424%" height="21" fill="rgb(255,238,238)" fg:x="1381398" fg:w="16932"/>
+            <text x="52.6626%" y="553.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:4041 (_lexsort_depth) (16,334 bytes, 0.62%)</title>
+            <rect x="52.4353%" y="562" width="0.6197%" height="21" fill="rgb(255,238,238)" fg:x="1381996" fg:w="16334"/>
+            <text x="52.6853%" y="575.50"></text>
+        </g>
+        <g>
+            <title>        if libalgos.is_lexsorted(int64_codes[:k]): (16,334 bytes, 0.62%)</title>
+            <rect x="52.4353%" y="584" width="0.6197%" height="21" fill="rgb(255,238,238)" fg:x="1381996" fg:w="16334"/>
+            <text x="52.6853%" y="597.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:3393 (_get_level_indexer) (17,174 bytes, 0.65%)</title>
+            <rect x="52.4126%" y="474" width="0.6516%" height="21" fill="rgb(255,237,237)" fg:x="1381398" fg:w="17174"/>
+            <text x="52.6626%" y="487.50"></text>
+        </g>
+        <g>
+            <title>            if level &gt; 0 or self._lexsort_depth == 0: (17,174 bytes, 0.65%)</title>
+            <rect x="52.4126%" y="496" width="0.6516%" height="21" fill="rgb(255,237,237)" fg:x="1381398" fg:w="17174"/>
+            <text x="52.6626%" y="509.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:3290 (_get_loc_level) (566,624 bytes, 21.50%)</title>
+            <rect x="31.6309%" y="430" width="21.4987%" height="21" fill="rgb(255,180,180)" fg:x="833670" fg:w="566624"/>
+            <text x="31.8809%" y="443.50">/Users/hal/miniforge3/lib..</text>
+        </g>
+        <g>
+            <title>            indexer = self._get_level_indexer(key, level=level) (566,624 bytes, 21.50%)</title>
+            <rect x="31.6309%" y="452" width="21.4987%" height="21" fill="rgb(255,180,180)" fg:x="833670" fg:w="566624"/>
+            <text x="31.8809%" y="465.50">            indexer = se..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:924 (_set_levels) (31,424 bytes, 1.19%)</title>
+            <rect x="53.2892%" y="606" width="1.1923%" height="21" fill="rgb(255,233,233)" fg:x="1404502" fg:w="31424"/>
+            <text x="53.5392%" y="619.50"></text>
+        </g>
+        <g>
+            <title>            new_levels = FrozenList( (31,424 bytes, 1.19%)</title>
+            <rect x="53.2892%" y="628" width="1.1923%" height="21" fill="rgb(255,233,233)" fg:x="1404502" fg:w="31424"/>
+            <text x="53.5392%" y="641.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:925 (&lt;genexpr&gt;) (30,880 bytes, 1.17%)</title>
+            <rect x="53.3099%" y="650" width="1.1716%" height="21" fill="rgb(255,233,233)" fg:x="1405046" fg:w="30880"/>
+            <text x="53.5599%" y="663.50"></text>
+        </g>
+        <g>
+            <title>                ensure_index(lev, copy=copy)._view() for lev in levels (30,880 bytes, 1.17%)</title>
+            <rect x="53.3099%" y="672" width="1.1716%" height="21" fill="rgb(255,233,233)" fg:x="1405046" fg:w="30880"/>
+            <text x="53.5599%" y="685.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/base.py:777 (_view) (30,880 bytes, 1.17%)</title>
+            <rect x="53.3099%" y="694" width="1.1716%" height="21" fill="rgb(255,233,233)" fg:x="1405046" fg:w="30880"/>
+            <text x="53.5599%" y="707.50"></text>
+        </g>
+        <g>
+            <title>        result = self._simple_new(self._values, name=self._name, refs=self._references) (30,880 bytes, 1.17%)</title>
+            <rect x="53.3099%" y="716" width="1.1716%" height="21" fill="rgb(255,233,233)" fg:x="1405046" fg:w="30880"/>
+            <text x="53.5599%" y="729.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/base.py:670 (_simple_new) (30,880 bytes, 1.17%)</title>
+            <rect x="53.3099%" y="738" width="1.1716%" height="21" fill="rgb(255,233,233)" fg:x="1405046" fg:w="30880"/>
+            <text x="53.5599%" y="751.50"></text>
+        </g>
+        <g>
+            <title>        result._references.add_index_reference(result) (30,880 bytes, 1.17%)</title>
+            <rect x="53.3099%" y="760" width="1.1716%" height="21" fill="rgb(255,233,233)" fg:x="1405046" fg:w="30880"/>
+            <text x="53.5599%" y="773.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:350 (__new__) (32,104 bytes, 1.22%)</title>
+            <rect x="53.2804%" y="562" width="1.2181%" height="21" fill="rgb(255,233,233)" fg:x="1404270" fg:w="32104"/>
+            <text x="53.5304%" y="575.50"></text>
+        </g>
+        <g>
+            <title>        result._set_levels(levels, copy=copy, validate=False) (32,104 bytes, 1.22%)</title>
+            <rect x="53.2804%" y="584" width="1.2181%" height="21" fill="rgb(255,233,233)" fg:x="1404270" fg:w="32104"/>
+            <text x="53.5304%" y="597.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:4139 (_coerce_indexer_frozen) (23,177 bytes, 0.88%)</title>
+            <rect x="54.4985%" y="694" width="0.8794%" height="21" fill="rgb(255,235,235)" fg:x="1436374" fg:w="23177"/>
+            <text x="54.7485%" y="707.50"></text>
+        </g>
+        <g>
+            <title>    array_like.flags.writeable = False (23,177 bytes, 0.88%)</title>
+            <rect x="54.4985%" y="716" width="0.8794%" height="21" fill="rgb(255,235,235)" fg:x="1436374" fg:w="23177"/>
+            <text x="54.7485%" y="729.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:1103 (&lt;genexpr&gt;) (23,431 bytes, 0.89%)</title>
+            <rect x="54.4985%" y="650" width="0.8890%" height="21" fill="rgb(255,235,235)" fg:x="1436374" fg:w="23431"/>
+            <text x="54.7485%" y="663.50"></text>
+        </g>
+        <g>
+            <title>                _coerce_indexer_frozen(level_codes, lev, copy=copy).view() (23,431 bytes, 0.89%)</title>
+            <rect x="54.4985%" y="672" width="0.8890%" height="21" fill="rgb(255,235,235)" fg:x="1436374" fg:w="23431"/>
+            <text x="54.7485%" y="685.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:351 (__new__) (23,619 bytes, 0.90%)</title>
+            <rect x="54.4985%" y="562" width="0.8961%" height="21" fill="rgb(255,235,235)" fg:x="1436374" fg:w="23619"/>
+            <text x="54.7485%" y="575.50"></text>
+        </g>
+        <g>
+            <title>        result._set_codes(codes, copy=copy, validate=False) (23,619 bytes, 0.90%)</title>
+            <rect x="54.4985%" y="584" width="0.8961%" height="21" fill="rgb(255,235,235)" fg:x="1436374" fg:w="23619"/>
+            <text x="54.7485%" y="597.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:1102 (_set_codes) (23,619 bytes, 0.90%)</title>
+            <rect x="54.4985%" y="606" width="0.8961%" height="21" fill="rgb(255,235,235)" fg:x="1436374" fg:w="23619"/>
+            <text x="54.7485%" y="619.50"></text>
+        </g>
+        <g>
+            <title>            new_codes = FrozenList( (23,619 bytes, 0.90%)</title>
+            <rect x="54.4985%" y="628" width="0.8961%" height="21" fill="rgb(255,235,235)" fg:x="1436374" fg:w="23619"/>
+            <text x="54.7485%" y="641.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:2209 (__getitem__) (58,529 bytes, 2.22%)</title>
+            <rect x="53.2303%" y="518" width="2.2207%" height="21" fill="rgb(255,227,227)" fg:x="1402950" fg:w="58529"/>
+            <text x="53.4803%" y="531.50"></text>
+        </g>
+        <g>
+            <title>            return MultiIndex( (58,529 bytes, 2.22%)</title>
+            <rect x="53.2303%" y="540" width="2.2207%" height="21" fill="rgb(255,227,227)" fg:x="1402950" fg:w="58529"/>
+            <text x="53.4803%" y="553.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:3170 (maybe_mi_droplevels) (60,599 bytes, 2.30%)</title>
+            <rect x="53.1989%" y="474" width="2.2992%" height="21" fill="rgb(255,227,227)" fg:x="1402122" fg:w="60599"/>
+            <text x="53.4489%" y="487.50"></text>
+        </g>
+        <g>
+            <title>            new_index = self[indexer] (60,599 bytes, 2.30%)</title>
+            <rect x="53.1989%" y="496" width="2.2992%" height="21" fill="rgb(255,227,227)" fg:x="1402122" fg:w="60599"/>
+            <text x="53.4489%" y="509.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/base.py:2175 (_drop_level_numbers) (39,928 bytes, 1.51%)</title>
+            <rect x="55.5182%" y="518" width="1.5149%" height="21" fill="rgb(255,231,231)" fg:x="1463249" fg:w="39928"/>
+            <text x="55.7682%" y="531.50"></text>
+        </g>
+        <g>
+            <title>        new_levels = list(self.levels) (39,928 bytes, 1.51%)</title>
+            <rect x="55.5182%" y="540" width="1.5149%" height="21" fill="rgb(255,231,231)" fg:x="1463249" fg:w="39928"/>
+            <text x="55.7682%" y="553.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:897 (levels) (39,200 bytes, 1.49%)</title>
+            <rect x="55.5458%" y="562" width="1.4873%" height="21" fill="rgb(255,231,231)" fg:x="1463977" fg:w="39200"/>
+            <text x="55.7958%" y="575.50"></text>
+        </g>
+        <g>
+            <title>        result = [x._rename(name=name) for x, name in zip(self._levels, self._names)] (39,200 bytes, 1.49%)</title>
+            <rect x="55.5458%" y="584" width="1.4873%" height="21" fill="rgb(255,231,231)" fg:x="1463977" fg:w="39200"/>
+            <text x="55.7958%" y="597.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/base.py:787 (_rename) (39,200 bytes, 1.49%)</title>
+            <rect x="55.5458%" y="606" width="1.4873%" height="21" fill="rgb(255,231,231)" fg:x="1463977" fg:w="39200"/>
+            <text x="55.7958%" y="619.50"></text>
+        </g>
+        <g>
+            <title>        result = self._view() (39,200 bytes, 1.49%)</title>
+            <rect x="55.5458%" y="628" width="1.4873%" height="21" fill="rgb(255,231,231)" fg:x="1463977" fg:w="39200"/>
+            <text x="55.7958%" y="641.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/base.py:777 (_view) (39,200 bytes, 1.49%)</title>
+            <rect x="55.5458%" y="650" width="1.4873%" height="21" fill="rgb(255,231,231)" fg:x="1463977" fg:w="39200"/>
+            <text x="55.7958%" y="663.50"></text>
+        </g>
+        <g>
+            <title>        result = self._simple_new(self._values, name=self._name, refs=self._references) (39,200 bytes, 1.49%)</title>
+            <rect x="55.5458%" y="672" width="1.4873%" height="21" fill="rgb(255,231,231)" fg:x="1463977" fg:w="39200"/>
+            <text x="55.7958%" y="685.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/base.py:670 (_simple_new) (39,200 bytes, 1.49%)</title>
+            <rect x="55.5458%" y="694" width="1.4873%" height="21" fill="rgb(255,231,231)" fg:x="1463977" fg:w="39200"/>
+            <text x="55.7958%" y="707.50"></text>
+        </g>
+        <g>
+            <title>        result._references.add_index_reference(result) (39,200 bytes, 1.49%)</title>
+            <rect x="55.5458%" y="716" width="1.4873%" height="21" fill="rgb(255,231,231)" fg:x="1463977" fg:w="39200"/>
+            <text x="55.7958%" y="729.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:924 (_set_levels) (10,160 bytes, 0.39%)</title>
+            <rect x="57.0984%" y="606" width="0.3855%" height="21" fill="rgb(255,240,240)" fg:x="1504897" fg:w="10160"/>
+            <text x="57.3484%" y="619.50"></text>
+        </g>
+        <g>
+            <title>            new_levels = FrozenList( (10,160 bytes, 0.39%)</title>
+            <rect x="57.0984%" y="628" width="0.3855%" height="21" fill="rgb(255,240,240)" fg:x="1504897" fg:w="10160"/>
+            <text x="57.3484%" y="641.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:925 (&lt;genexpr&gt;) (10,160 bytes, 0.39%)</title>
+            <rect x="57.0984%" y="650" width="0.3855%" height="21" fill="rgb(255,240,240)" fg:x="1504897" fg:w="10160"/>
+            <text x="57.3484%" y="663.50"></text>
+        </g>
+        <g>
+            <title>                ensure_index(lev, copy=copy)._view() for lev in levels (10,160 bytes, 0.39%)</title>
+            <rect x="57.0984%" y="672" width="0.3855%" height="21" fill="rgb(255,240,240)" fg:x="1504897" fg:w="10160"/>
+            <text x="57.3484%" y="685.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/base.py:777 (_view) (10,160 bytes, 0.39%)</title>
+            <rect x="57.0984%" y="694" width="0.3855%" height="21" fill="rgb(255,240,240)" fg:x="1504897" fg:w="10160"/>
+            <text x="57.3484%" y="707.50"></text>
+        </g>
+        <g>
+            <title>        result = self._simple_new(self._values, name=self._name, refs=self._references) (10,160 bytes, 0.39%)</title>
+            <rect x="57.0984%" y="716" width="0.3855%" height="21" fill="rgb(255,240,240)" fg:x="1504897" fg:w="10160"/>
+            <text x="57.3484%" y="729.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/base.py:670 (_simple_new) (9,920 bytes, 0.38%)</title>
+            <rect x="57.1075%" y="738" width="0.3764%" height="21" fill="rgb(255,240,240)" fg:x="1505137" fg:w="9920"/>
+            <text x="57.3575%" y="751.50"></text>
+        </g>
+        <g>
+            <title>        result._references.add_index_reference(result) (9,920 bytes, 0.38%)</title>
+            <rect x="57.1075%" y="760" width="0.3764%" height="21" fill="rgb(255,240,240)" fg:x="1505137" fg:w="9920"/>
+            <text x="57.3575%" y="773.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:350 (__new__) (10,496 bytes, 0.40%)</title>
+            <rect x="57.0984%" y="562" width="0.3982%" height="21" fill="rgb(255,240,240)" fg:x="1504897" fg:w="10496"/>
+            <text x="57.3484%" y="575.50"></text>
+        </g>
+        <g>
+            <title>        result._set_levels(levels, copy=copy, validate=False) (10,496 bytes, 0.40%)</title>
+            <rect x="57.0984%" y="584" width="0.3982%" height="21" fill="rgb(255,240,240)" fg:x="1504897" fg:w="10496"/>
+            <text x="57.3484%" y="597.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:351 (__new__) (9,943 bytes, 0.38%)</title>
+            <rect x="57.4966%" y="562" width="0.3773%" height="21" fill="rgb(255,240,240)" fg:x="1515393" fg:w="9943"/>
+            <text x="57.7466%" y="575.50"></text>
+        </g>
+        <g>
+            <title>        result._set_codes(codes, copy=copy, validate=False) (9,943 bytes, 0.38%)</title>
+            <rect x="57.4966%" y="584" width="0.3773%" height="21" fill="rgb(255,240,240)" fg:x="1515393" fg:w="9943"/>
+            <text x="57.7466%" y="597.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:1102 (_set_codes) (9,943 bytes, 0.38%)</title>
+            <rect x="57.4966%" y="606" width="0.3773%" height="21" fill="rgb(255,240,240)" fg:x="1515393" fg:w="9943"/>
+            <text x="57.7466%" y="619.50"></text>
+        </g>
+        <g>
+            <title>            new_codes = FrozenList( (9,943 bytes, 0.38%)</title>
+            <rect x="57.4966%" y="628" width="0.3773%" height="21" fill="rgb(255,240,240)" fg:x="1515393" fg:w="9943"/>
+            <text x="57.7466%" y="641.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:1103 (&lt;genexpr&gt;) (9,943 bytes, 0.38%)</title>
+            <rect x="57.4966%" y="650" width="0.3773%" height="21" fill="rgb(255,240,240)" fg:x="1515393" fg:w="9943"/>
+            <text x="57.7466%" y="663.50"></text>
+        </g>
+        <g>
+            <title>                _coerce_indexer_frozen(level_codes, lev, copy=copy).view() (9,943 bytes, 0.38%)</title>
+            <rect x="57.4966%" y="672" width="0.3773%" height="21" fill="rgb(255,240,240)" fg:x="1515393" fg:w="9943"/>
+            <text x="57.7466%" y="685.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:4139 (_coerce_indexer_frozen) (9,751 bytes, 0.37%)</title>
+            <rect x="57.5039%" y="694" width="0.3700%" height="21" fill="rgb(255,240,240)" fg:x="1515585" fg:w="9751"/>
+            <text x="57.7539%" y="707.50"></text>
+        </g>
+        <g>
+            <title>    array_like.flags.writeable = False (9,751 bytes, 0.37%)</title>
+            <rect x="57.5039%" y="716" width="0.3700%" height="21" fill="rgb(255,240,240)" fg:x="1515585" fg:w="9751"/>
+            <text x="57.7539%" y="729.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:3302 (_get_loc_level) (125,266 bytes, 4.75%)</title>
+            <rect x="53.1296%" y="430" width="4.7528%" height="21" fill="rgb(255,217,217)" fg:x="1400294" fg:w="125266"/>
+            <text x="53.3796%" y="443.50">/Use..</text>
+        </g>
+        <g>
+            <title>                result_index = maybe_mi_droplevels(indexer, [level]) (125,266 bytes, 4.75%)</title>
+            <rect x="53.1296%" y="452" width="4.7528%" height="21" fill="rgb(255,217,217)" fg:x="1400294" fg:w="125266"/>
+            <text x="53.3796%" y="465.50">   ..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:3173 (maybe_mi_droplevels) (62,839 bytes, 2.38%)</title>
+            <rect x="55.4982%" y="474" width="2.3842%" height="21" fill="rgb(255,226,226)" fg:x="1462721" fg:w="62839"/>
+            <text x="55.7482%" y="487.50">/..</text>
+        </g>
+        <g>
+            <title>                new_index = new_index._drop_level_numbers([i]) (62,839 bytes, 2.38%)</title>
+            <rect x="55.4982%" y="496" width="2.3842%" height="21" fill="rgb(255,226,226)" fg:x="1462721" fg:w="62839"/>
+            <text x="55.7482%" y="509.50">..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/base.py:2210 (_drop_level_numbers) (20,663 bytes, 0.78%)</title>
+            <rect x="57.0984%" y="518" width="0.7840%" height="21" fill="rgb(255,236,236)" fg:x="1504897" fg:w="20663"/>
+            <text x="57.3484%" y="531.50"></text>
+        </g>
+        <g>
+            <title>            return MultiIndex( (20,663 bytes, 0.78%)</title>
+            <rect x="57.0984%" y="540" width="0.7840%" height="21" fill="rgb(255,236,236)" fg:x="1504897" fg:w="20663"/>
+            <text x="57.3484%" y="553.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:3150 (get_loc_level) (693,544 bytes, 26.31%)</title>
+            <rect x="31.6309%" y="386" width="26.3143%" height="21" fill="rgb(255,173,173)" fg:x="833670" fg:w="693544"/>
+            <text x="31.8809%" y="399.50">/Users/hal/miniforge3/lib/pytho..</text>
+        </g>
+        <g>
+            <title>        loc, mi = self._get_loc_level(key, level=level) (693,544 bytes, 26.31%)</title>
+            <rect x="31.6309%" y="408" width="26.3143%" height="21" fill="rgb(255,173,173)" fg:x="833670" fg:w="693544"/>
+            <text x="31.8809%" y="421.50">        loc, mi = self._get_lo..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/generic.py:4274 (xs) (696,538 bytes, 26.43%)</title>
+            <rect x="31.6083%" y="342" width="26.4279%" height="21" fill="rgb(255,172,172)" fg:x="833074" fg:w="696538"/>
+            <text x="31.8583%" y="355.50">/Users/hal/miniforge3/lib/pytho..</text>
+        </g>
+        <g>
+            <title>            loc, new_ax = labels.get_loc_level(key, level=level, drop_level=drop_level) (696,538 bytes, 26.43%)</title>
+            <rect x="31.6083%" y="364" width="26.4279%" height="21" fill="rgb(255,172,172)" fg:x="833074" fg:w="696538"/>
+            <text x="31.8583%" y="377.50">            loc, new_ax = labe..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexing.py:1180 (__getitem__) (39,532 bytes, 1.50%)</title>
+            <rect x="58.0361%" y="386" width="1.4999%" height="21" fill="rgb(255,231,231)" fg:x="1529612" fg:w="39532"/>
+            <text x="58.2861%" y="399.50"></text>
+        </g>
+        <g>
+            <title>            key = tuple(list(x) if is_iterator(x) else x for x in key) (39,532 bytes, 1.50%)</title>
+            <rect x="58.0361%" y="408" width="1.4999%" height="21" fill="rgb(255,231,231)" fg:x="1529612" fg:w="39532"/>
+            <text x="58.2861%" y="421.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexing.py:1181 (__getitem__) (39,494 bytes, 1.50%)</title>
+            <rect x="59.5360%" y="386" width="1.4985%" height="21" fill="rgb(255,231,231)" fg:x="1569144" fg:w="39494"/>
+            <text x="59.7860%" y="399.50"></text>
+        </g>
+        <g>
+            <title>            key = tuple(com.apply_if_callable(x, self.obj) for x in key) (39,494 bytes, 1.50%)</title>
+            <rect x="59.5360%" y="408" width="1.4985%" height="21" fill="rgb(255,231,231)" fg:x="1569144" fg:w="39494"/>
+            <text x="59.7860%" y="421.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:924 (_set_levels) (25,808 bytes, 0.98%)</title>
+            <rect x="73.4626%" y="782" width="0.9792%" height="21" fill="rgb(255,235,235)" fg:x="1936196" fg:w="25808"/>
+            <text x="73.7126%" y="795.50"></text>
+        </g>
+        <g>
+            <title>            new_levels = FrozenList( (25,808 bytes, 0.98%)</title>
+            <rect x="73.4626%" y="804" width="0.9792%" height="21" fill="rgb(255,235,235)" fg:x="1936196" fg:w="25808"/>
+            <text x="73.7126%" y="817.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:925 (&lt;genexpr&gt;) (25,808 bytes, 0.98%)</title>
+            <rect x="73.4626%" y="826" width="0.9792%" height="21" fill="rgb(255,235,235)" fg:x="1936196" fg:w="25808"/>
+            <text x="73.7126%" y="839.50"></text>
+        </g>
+        <g>
+            <title>                ensure_index(lev, copy=copy)._view() for lev in levels (25,808 bytes, 0.98%)</title>
+            <rect x="73.4626%" y="848" width="0.9792%" height="21" fill="rgb(255,235,235)" fg:x="1936196" fg:w="25808"/>
+            <text x="73.7126%" y="861.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/base.py:777 (_view) (25,808 bytes, 0.98%)</title>
+            <rect x="73.4626%" y="870" width="0.9792%" height="21" fill="rgb(255,235,235)" fg:x="1936196" fg:w="25808"/>
+            <text x="73.7126%" y="883.50"></text>
+        </g>
+        <g>
+            <title>        result = self._simple_new(self._values, name=self._name, refs=self._references) (25,808 bytes, 0.98%)</title>
+            <rect x="73.4626%" y="892" width="0.9792%" height="21" fill="rgb(255,235,235)" fg:x="1936196" fg:w="25808"/>
+            <text x="73.7126%" y="905.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/base.py:670 (_simple_new) (25,568 bytes, 0.97%)</title>
+            <rect x="73.4717%" y="914" width="0.9701%" height="21" fill="rgb(255,235,235)" fg:x="1936436" fg:w="25568"/>
+            <text x="73.7217%" y="927.50"></text>
+        </g>
+        <g>
+            <title>        result._references.add_index_reference(result) (25,568 bytes, 0.97%)</title>
+            <rect x="73.4717%" y="936" width="0.9701%" height="21" fill="rgb(255,235,235)" fg:x="1936436" fg:w="25568"/>
+            <text x="73.7217%" y="949.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:350 (__new__) (26,256 bytes, 1.00%)</title>
+            <rect x="73.4626%" y="738" width="0.9962%" height="21" fill="rgb(255,235,235)" fg:x="1936196" fg:w="26256"/>
+            <text x="73.7126%" y="751.50"></text>
+        </g>
+        <g>
+            <title>        result._set_levels(levels, copy=copy, validate=False) (26,256 bytes, 1.00%)</title>
+            <rect x="73.4626%" y="760" width="0.9962%" height="21" fill="rgb(255,235,235)" fg:x="1936196" fg:w="26256"/>
+            <text x="73.7126%" y="773.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:351 (__new__) (16,198 bytes, 0.61%)</title>
+            <rect x="74.4588%" y="738" width="0.6146%" height="21" fill="rgb(255,238,238)" fg:x="1962452" fg:w="16198"/>
+            <text x="74.7088%" y="751.50"></text>
+        </g>
+        <g>
+            <title>        result._set_codes(codes, copy=copy, validate=False) (16,198 bytes, 0.61%)</title>
+            <rect x="74.4588%" y="760" width="0.6146%" height="21" fill="rgb(255,238,238)" fg:x="1962452" fg:w="16198"/>
+            <text x="74.7088%" y="773.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:1102 (_set_codes) (16,198 bytes, 0.61%)</title>
+            <rect x="74.4588%" y="782" width="0.6146%" height="21" fill="rgb(255,238,238)" fg:x="1962452" fg:w="16198"/>
+            <text x="74.7088%" y="795.50"></text>
+        </g>
+        <g>
+            <title>            new_codes = FrozenList( (16,198 bytes, 0.61%)</title>
+            <rect x="74.4588%" y="804" width="0.6146%" height="21" fill="rgb(255,238,238)" fg:x="1962452" fg:w="16198"/>
+            <text x="74.7088%" y="817.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:1103 (&lt;genexpr&gt;) (16,198 bytes, 0.61%)</title>
+            <rect x="74.4588%" y="826" width="0.6146%" height="21" fill="rgb(255,238,238)" fg:x="1962452" fg:w="16198"/>
+            <text x="74.7088%" y="839.50"></text>
+        </g>
+        <g>
+            <title>                _coerce_indexer_frozen(level_codes, lev, copy=copy).view() (16,198 bytes, 0.61%)</title>
+            <rect x="74.4588%" y="848" width="0.6146%" height="21" fill="rgb(255,238,238)" fg:x="1962452" fg:w="16198"/>
+            <text x="74.7088%" y="861.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:4139 (_coerce_indexer_frozen) (15,974 bytes, 0.61%)</title>
+            <rect x="74.4673%" y="870" width="0.6061%" height="21" fill="rgb(255,238,238)" fg:x="1962676" fg:w="15974"/>
+            <text x="74.7173%" y="883.50"></text>
+        </g>
+        <g>
+            <title>    array_like.flags.writeable = False (15,974 bytes, 0.61%)</title>
+            <rect x="74.4673%" y="892" width="0.6061%" height="21" fill="rgb(255,238,238)" fg:x="1962676" fg:w="15974"/>
+            <text x="74.7173%" y="905.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:2227 (_getitem_slice) (42,846 bytes, 1.63%)</title>
+            <rect x="73.4626%" y="694" width="1.6257%" height="21" fill="rgb(255,230,230)" fg:x="1936196" fg:w="42846"/>
+            <text x="73.7126%" y="707.50"></text>
+        </g>
+        <g>
+            <title>        return type(self)( (42,846 bytes, 1.63%)</title>
+            <rect x="73.4626%" y="716" width="1.6257%" height="21" fill="rgb(255,230,230)" fg:x="1936196" fg:w="42846"/>
+            <text x="73.7126%" y="729.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/internals/blocks.py:2529 (slice_block_rows) (40,896 bytes, 1.55%)</title>
+            <rect x="75.1873%" y="694" width="1.5517%" height="21" fill="rgb(255,231,231)" fg:x="1981652" fg:w="40896"/>
+            <text x="75.4373%" y="707.50"></text>
+        </g>
+        <g>
+            <title>        return type(self)(new_values, self._mgr_locs, ndim=self.ndim, refs=self.refs) (40,896 bytes, 1.55%)</title>
+            <rect x="75.1873%" y="716" width="1.5517%" height="21" fill="rgb(255,231,231)" fg:x="1981652" fg:w="40896"/>
+            <text x="75.4373%" y="729.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/generic.py:4369 (_slice) (409,720 bytes, 15.55%)</title>
+            <rect x="61.2059%" y="650" width="15.5455%" height="21" fill="rgb(255,190,190)" fg:x="1613156" fg:w="409720"/>
+            <text x="61.4559%" y="663.50">/Users/hal/minifo..</text>
+        </g>
+        <g>
+            <title>        new_mgr = self._mgr.get_slice(slobj, axis=axis) (409,720 bytes, 15.55%)</title>
+            <rect x="61.2059%" y="672" width="15.5455%" height="21" fill="rgb(255,190,190)" fg:x="1613156" fg:w="409720"/>
+            <text x="61.4559%" y="685.50">        new_mgr ..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/generic.py:4370 (_slice) (8,928 bytes, 0.34%)</title>
+            <rect x="76.7514%" y="650" width="0.3387%" height="21" fill="rgb(255,241,241)" fg:x="2022876" fg:w="8928"/>
+            <text x="77.0014%" y="663.50"></text>
+        </g>
+        <g>
+            <title>        result = self._constructor_from_mgr(new_mgr, axes=new_mgr.axes) (8,928 bytes, 0.34%)</title>
+            <rect x="76.7514%" y="672" width="0.3387%" height="21" fill="rgb(255,241,241)" fg:x="2022876" fg:w="8928"/>
+            <text x="77.0014%" y="685.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexing.py:1765 (_get_slice_axis) (421,440 bytes, 15.99%)</title>
+            <rect x="61.1498%" y="606" width="15.9902%" height="21" fill="rgb(255,190,190)" fg:x="1611676" fg:w="421440"/>
+            <text x="61.3998%" y="619.50">/Users/hal/minifor..</text>
+        </g>
+        <g>
+            <title>        return self.obj._slice(slice_obj, axis=axis) (421,440 bytes, 15.99%)</title>
+            <rect x="61.1498%" y="628" width="15.9902%" height="21" fill="rgb(255,190,190)" fg:x="1611676" fg:w="421440"/>
+            <text x="61.3998%" y="641.50">        return se..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexing.py:1729 (_getitem_axis) (422,340 bytes, 16.02%)</title>
+            <rect x="61.1498%" y="562" width="16.0243%" height="21" fill="rgb(255,190,190)" fg:x="1611676" fg:w="422340"/>
+            <text x="61.3998%" y="575.50">/Users/hal/minifor..</text>
+        </g>
+        <g>
+            <title>            return self._get_slice_axis(key, axis=axis) (422,340 bytes, 16.02%)</title>
+            <rect x="61.1498%" y="584" width="16.0243%" height="21" fill="rgb(255,190,190)" fg:x="1611676" fg:w="422340"/>
+            <text x="61.3998%" y="597.50">            retur..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/internals/managers.py:890 (take) (14,026 bytes, 0.53%)</title>
+            <rect x="77.3500%" y="738" width="0.5322%" height="21" fill="rgb(255,239,239)" fg:x="2038654" fg:w="14026"/>
+            <text x="77.6000%" y="751.50"></text>
+        </g>
+        <g>
+            <title>        n = self.shape[axis] (14,026 bytes, 0.53%)</title>
+            <rect x="77.3500%" y="760" width="0.5322%" height="21" fill="rgb(255,239,239)" fg:x="2038654" fg:w="14026"/>
+            <text x="77.6000%" y="773.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/internals/base.py:84 (shape) (14,026 bytes, 0.53%)</title>
+            <rect x="77.3500%" y="782" width="0.5322%" height="21" fill="rgb(255,239,239)" fg:x="2038654" fg:w="14026"/>
+            <text x="77.6000%" y="795.50"></text>
+        </g>
+        <g>
+            <title>        return tuple(len(ax) for ax in self.axes) (14,026 bytes, 0.53%)</title>
+            <rect x="77.3500%" y="804" width="0.5322%" height="21" fill="rgb(255,239,239)" fg:x="2038654" fg:w="14026"/>
+            <text x="77.6000%" y="817.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:350 (__new__) (8,960 bytes, 0.34%)</title>
+            <rect x="77.8822%" y="826" width="0.3400%" height="21" fill="rgb(255,241,241)" fg:x="2052680" fg:w="8960"/>
+            <text x="78.1322%" y="839.50"></text>
+        </g>
+        <g>
+            <title>        result._set_levels(levels, copy=copy, validate=False) (8,960 bytes, 0.34%)</title>
+            <rect x="77.8822%" y="848" width="0.3400%" height="21" fill="rgb(255,241,241)" fg:x="2052680" fg:w="8960"/>
+            <text x="78.1322%" y="861.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:924 (_set_levels) (8,960 bytes, 0.34%)</title>
+            <rect x="77.8822%" y="870" width="0.3400%" height="21" fill="rgb(255,241,241)" fg:x="2052680" fg:w="8960"/>
+            <text x="78.1322%" y="883.50"></text>
+        </g>
+        <g>
+            <title>            new_levels = FrozenList( (8,960 bytes, 0.34%)</title>
+            <rect x="77.8822%" y="892" width="0.3400%" height="21" fill="rgb(255,241,241)" fg:x="2052680" fg:w="8960"/>
+            <text x="78.1322%" y="905.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:925 (&lt;genexpr&gt;) (8,960 bytes, 0.34%)</title>
+            <rect x="77.8822%" y="914" width="0.3400%" height="21" fill="rgb(255,241,241)" fg:x="2052680" fg:w="8960"/>
+            <text x="78.1322%" y="927.50"></text>
+        </g>
+        <g>
+            <title>                ensure_index(lev, copy=copy)._view() for lev in levels (8,960 bytes, 0.34%)</title>
+            <rect x="77.8822%" y="936" width="0.3400%" height="21" fill="rgb(255,241,241)" fg:x="2052680" fg:w="8960"/>
+            <text x="78.1322%" y="949.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/base.py:777 (_view) (8,960 bytes, 0.34%)</title>
+            <rect x="77.8822%" y="958" width="0.3400%" height="21" fill="rgb(255,241,241)" fg:x="2052680" fg:w="8960"/>
+            <text x="78.1322%" y="971.50"></text>
+        </g>
+        <g>
+            <title>        result = self._simple_new(self._values, name=self._name, refs=self._references) (8,960 bytes, 0.34%)</title>
+            <rect x="77.8822%" y="980" width="0.3400%" height="21" fill="rgb(255,241,241)" fg:x="2052680" fg:w="8960"/>
+            <text x="78.1322%" y="993.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/base.py:670 (_simple_new) (8,960 bytes, 0.34%)</title>
+            <rect x="77.8822%" y="1002" width="0.3400%" height="21" fill="rgb(255,241,241)" fg:x="2052680" fg:w="8960"/>
+            <text x="78.1322%" y="1015.50"></text>
+        </g>
+        <g>
+            <title>        result._references.add_index_reference(result) (8,960 bytes, 0.34%)</title>
+            <rect x="77.8822%" y="1024" width="0.3400%" height="21" fill="rgb(255,241,241)" fg:x="2052680" fg:w="8960"/>
+            <text x="78.1322%" y="1037.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/internals/managers.py:893 (take) (17,682 bytes, 0.67%)</title>
+            <rect x="77.8822%" y="738" width="0.6709%" height="21" fill="rgb(255,237,237)" fg:x="2052680" fg:w="17682"/>
+            <text x="78.1322%" y="751.50"></text>
+        </g>
+        <g>
+            <title>        new_labels = self.axes[axis].take(indexer) (17,682 bytes, 0.67%)</title>
+            <rect x="77.8822%" y="760" width="0.6709%" height="21" fill="rgb(255,237,237)" fg:x="2052680" fg:w="17682"/>
+            <text x="78.1322%" y="773.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:2263 (take) (17,682 bytes, 0.67%)</title>
+            <rect x="77.8822%" y="782" width="0.6709%" height="21" fill="rgb(255,237,237)" fg:x="2052680" fg:w="17682"/>
+            <text x="78.1322%" y="795.50"></text>
+        </g>
+        <g>
+            <title>        return MultiIndex( (17,682 bytes, 0.67%)</title>
+            <rect x="77.8822%" y="804" width="0.6709%" height="21" fill="rgb(255,237,237)" fg:x="2052680" fg:w="17682"/>
+            <text x="78.1322%" y="817.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:351 (__new__) (8,722 bytes, 0.33%)</title>
+            <rect x="78.2222%" y="826" width="0.3309%" height="21" fill="rgb(255,241,241)" fg:x="2061640" fg:w="8722"/>
+            <text x="78.4722%" y="839.50"></text>
+        </g>
+        <g>
+            <title>        result._set_codes(codes, copy=copy, validate=False) (8,722 bytes, 0.33%)</title>
+            <rect x="78.2222%" y="848" width="0.3309%" height="21" fill="rgb(255,241,241)" fg:x="2061640" fg:w="8722"/>
+            <text x="78.4722%" y="861.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:1102 (_set_codes) (8,722 bytes, 0.33%)</title>
+            <rect x="78.2222%" y="870" width="0.3309%" height="21" fill="rgb(255,241,241)" fg:x="2061640" fg:w="8722"/>
+            <text x="78.4722%" y="883.50"></text>
+        </g>
+        <g>
+            <title>            new_codes = FrozenList( (8,722 bytes, 0.33%)</title>
+            <rect x="78.2222%" y="892" width="0.3309%" height="21" fill="rgb(255,241,241)" fg:x="2061640" fg:w="8722"/>
+            <text x="78.4722%" y="905.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:1103 (&lt;genexpr&gt;) (8,722 bytes, 0.33%)</title>
+            <rect x="78.2222%" y="914" width="0.3309%" height="21" fill="rgb(255,241,241)" fg:x="2061640" fg:w="8722"/>
+            <text x="78.4722%" y="927.50"></text>
+        </g>
+        <g>
+            <title>                _coerce_indexer_frozen(level_codes, lev, copy=copy).view() (8,722 bytes, 0.33%)</title>
+            <rect x="78.2222%" y="936" width="0.3309%" height="21" fill="rgb(255,241,241)" fg:x="2061640" fg:w="8722"/>
+            <text x="78.4722%" y="949.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexes/multi.py:4139 (_coerce_indexer_frozen) (8,722 bytes, 0.33%)</title>
+            <rect x="78.2222%" y="958" width="0.3309%" height="21" fill="rgb(255,241,241)" fg:x="2061640" fg:w="8722"/>
+            <text x="78.4722%" y="971.50"></text>
+        </g>
+        <g>
+            <title>    array_like.flags.writeable = False (8,722 bytes, 0.33%)</title>
+            <rect x="78.2222%" y="980" width="0.3309%" height="21" fill="rgb(255,241,241)" fg:x="2061640" fg:w="8722"/>
+            <text x="78.4722%" y="993.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/shapely/decorators.py:76 (wrapped) (5,586 bytes, 0.21%)</title>
+            <rect x="78.5808%" y="958" width="0.2119%" height="21" fill="rgb(255,243,243)" fg:x="2071092" fg:w="5586"/>
+            <text x="78.8308%" y="971.50"></text>
+        </g>
+        <g>
+            <title>                arr.flags.writeable = False (5,586 bytes, 0.21%)</title>
+            <rect x="78.5808%" y="980" width="0.2119%" height="21" fill="rgb(255,243,243)" fg:x="2071092" fg:w="5586"/>
+            <text x="78.8308%" y="993.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/geopandas/array.py:1213 (take) (10,290 bytes, 0.39%)</title>
+            <rect x="78.5808%" y="914" width="0.3904%" height="21" fill="rgb(255,240,240)" fg:x="2071092" fg:w="10290"/>
+            <text x="78.8308%" y="927.50"></text>
+        </g>
+        <g>
+            <title>            result[~shapely.is_valid_input(result)] = None (10,290 bytes, 0.39%)</title>
+            <rect x="78.5808%" y="936" width="0.3904%" height="21" fill="rgb(255,240,240)" fg:x="2071092" fg:w="10290"/>
+            <text x="78.8308%" y="949.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/array_algos/take.py:114 (take_nd) (11,260 bytes, 0.43%)</title>
+            <rect x="78.5711%" y="870" width="0.4272%" height="21" fill="rgb(255,240,240)" fg:x="2070836" fg:w="11260"/>
+            <text x="78.8211%" y="883.50"></text>
+        </g>
+        <g>
+            <title>        return arr.take(indexer, fill_value=fill_value, allow_fill=allow_fill) (11,260 bytes, 0.43%)</title>
+            <rect x="78.5711%" y="892" width="0.4272%" height="21" fill="rgb(255,240,240)" fg:x="2070836" fg:w="11260"/>
+            <text x="78.8211%" y="905.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/array_algos/take.py:579 (_take_preprocess_indexer_and_fill_value) (5,390 bytes, 0.20%)</title>
+            <rect x="79.0164%" y="958" width="0.2045%" height="21" fill="rgb(255,243,243)" fg:x="2082572" fg:w="5390"/>
+            <text x="79.2664%" y="971.50"></text>
+        </g>
+        <g>
+            <title>        dtype, fill_value = maybe_promote(arr.dtype, fill_value) (5,390 bytes, 0.20%)</title>
+            <rect x="79.0164%" y="980" width="0.2045%" height="21" fill="rgb(255,243,243)" fg:x="2082572" fg:w="5390"/>
+            <text x="79.2664%" y="993.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/dtypes/cast.py:590 (maybe_promote) (5,390 bytes, 0.20%)</title>
+            <rect x="79.0164%" y="1002" width="0.2045%" height="21" fill="rgb(255,243,243)" fg:x="2082572" fg:w="5390"/>
+            <text x="79.2664%" y="1015.50"></text>
+        </g>
+        <g>
+            <title>        dtype, fill_value = _maybe_promote_cached( (5,390 bytes, 0.20%)</title>
+            <rect x="79.0164%" y="1024" width="0.2045%" height="21" fill="rgb(255,243,243)" fg:x="2082572" fg:w="5390"/>
+            <text x="79.2664%" y="1037.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/array_algos/take.py:133 (_take_nd_ndarray) (6,122 bytes, 0.23%)</title>
+            <rect x="78.9983%" y="914" width="0.2323%" height="21" fill="rgb(255,242,242)" fg:x="2082096" fg:w="6122"/>
+            <text x="79.2483%" y="927.50"></text>
+        </g>
+        <g>
+            <title>    dtype, fill_value, mask_info = _take_preprocess_indexer_and_fill_value( (6,122 bytes, 0.23%)</title>
+            <rect x="78.9983%" y="936" width="0.2323%" height="21" fill="rgb(255,242,242)" fg:x="2082096" fg:w="6122"/>
+            <text x="79.2483%" y="949.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/array_algos/take.py:117 (take_nd) (9,738 bytes, 0.37%)</title>
+            <rect x="78.9983%" y="870" width="0.3695%" height="21" fill="rgb(255,240,240)" fg:x="2082096" fg:w="9738"/>
+            <text x="79.2483%" y="883.50"></text>
+        </g>
+        <g>
+            <title>    return _take_nd_ndarray(arr, indexer, axis, fill_value, allow_fill) (9,738 bytes, 0.37%)</title>
+            <rect x="78.9983%" y="892" width="0.3695%" height="21" fill="rgb(255,240,240)" fg:x="2082096" fg:w="9738"/>
+            <text x="79.2483%" y="905.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/internals/blocks.py:1307 (take_nd) (22,238 bytes, 0.84%)</title>
+            <rect x="78.5711%" y="826" width="0.8437%" height="21" fill="rgb(255,236,236)" fg:x="2070836" fg:w="22238"/>
+            <text x="78.8211%" y="839.50"></text>
+        </g>
+        <g>
+            <title>        new_values = algos.take_nd( (22,238 bytes, 0.84%)</title>
+            <rect x="78.5711%" y="848" width="0.8437%" height="21" fill="rgb(255,236,236)" fg:x="2070836" fg:w="22238"/>
+            <text x="78.8211%" y="861.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/internals/managers.py:688 (reindex_indexer) (23,672 bytes, 0.90%)</title>
+            <rect x="78.5711%" y="782" width="0.8982%" height="21" fill="rgb(255,235,235)" fg:x="2070836" fg:w="23672"/>
+            <text x="78.8211%" y="795.50"></text>
+        </g>
+        <g>
+            <title>                blk.take_nd( (23,672 bytes, 0.90%)</title>
+            <rect x="78.5711%" y="804" width="0.8982%" height="21" fill="rgb(255,235,235)" fg:x="2070836" fg:w="23672"/>
+            <text x="78.8211%" y="817.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/generic.py:4133 (take) (71,964 bytes, 2.73%)</title>
+            <rect x="77.2799%" y="694" width="2.7304%" height="21" fill="rgb(255,225,225)" fg:x="2036806" fg:w="71964"/>
+            <text x="77.5299%" y="707.50">/..</text>
+        </g>
+        <g>
+            <title>        new_data = self._mgr.take( (71,964 bytes, 2.73%)</title>
+            <rect x="77.2799%" y="716" width="2.7304%" height="21" fill="rgb(255,225,225)" fg:x="2036806" fg:w="71964"/>
+            <text x="77.5299%" y="729.50">..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/internals/managers.py:894 (take) (38,408 bytes, 1.46%)</title>
+            <rect x="78.5531%" y="738" width="1.4573%" height="21" fill="rgb(255,231,231)" fg:x="2070362" fg:w="38408"/>
+            <text x="78.8031%" y="751.50"></text>
+        </g>
+        <g>
+            <title>        return self.reindex_indexer( (38,408 bytes, 1.46%)</title>
+            <rect x="78.5531%" y="760" width="1.4573%" height="21" fill="rgb(255,231,231)" fg:x="2070362" fg:w="38408"/>
+            <text x="78.8031%" y="773.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/internals/managers.py:704 (reindex_indexer) (13,776 bytes, 0.52%)</title>
+            <rect x="79.4877%" y="782" width="0.5227%" height="21" fill="rgb(255,239,239)" fg:x="2094994" fg:w="13776"/>
+            <text x="79.7377%" y="795.50"></text>
+        </g>
+        <g>
+            <title>            new_mgr._blknos = self.blknos.copy() (13,776 bytes, 0.52%)</title>
+            <rect x="79.4877%" y="804" width="0.5227%" height="21" fill="rgb(255,239,239)" fg:x="2094994" fg:w="13776"/>
+            <text x="79.7377%" y="817.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/internals/managers.py:192 (blknos) (13,776 bytes, 0.52%)</title>
+            <rect x="79.4877%" y="826" width="0.5227%" height="21" fill="rgb(255,239,239)" fg:x="2094994" fg:w="13776"/>
+            <text x="79.7377%" y="839.50"></text>
+        </g>
+        <g>
+            <title>            self._rebuild_blknos_and_blklocs() (13,776 bytes, 0.52%)</title>
+            <rect x="79.4877%" y="848" width="0.5227%" height="21" fill="rgb(255,239,239)" fg:x="2094994" fg:w="13776"/>
+            <text x="79.7377%" y="861.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/internals/base.py:84 (shape) (13,776 bytes, 0.52%)</title>
+            <rect x="79.4877%" y="870" width="0.5227%" height="21" fill="rgb(255,239,239)" fg:x="2094994" fg:w="13776"/>
+            <text x="79.7377%" y="883.50"></text>
+        </g>
+        <g>
+            <title>        return tuple(len(ax) for ax in self.axes) (13,776 bytes, 0.52%)</title>
+            <rect x="79.4877%" y="892" width="0.5227%" height="21" fill="rgb(255,239,239)" fg:x="2094994" fg:w="13776"/>
+            <text x="79.7377%" y="905.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexing.py:1211 (_getbool_axis) (76,000 bytes, 2.88%)</title>
+            <rect x="77.2061%" y="606" width="2.8836%" height="21" fill="rgb(255,224,224)" fg:x="2034860" fg:w="76000"/>
+            <text x="77.4561%" y="619.50">/..</text>
+        </g>
+        <g>
+            <title>        return self.obj._take_with_is_copy(inds, axis=axis) (76,000 bytes, 2.88%)</title>
+            <rect x="77.2061%" y="628" width="2.8836%" height="21" fill="rgb(255,224,224)" fg:x="2034860" fg:w="76000"/>
+            <text x="77.4561%" y="641.50">..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/generic.py:4153 (_take_with_is_copy) (74,054 bytes, 2.81%)</title>
+            <rect x="77.2799%" y="650" width="2.8097%" height="21" fill="rgb(255,224,224)" fg:x="2036806" fg:w="74054"/>
+            <text x="77.5299%" y="663.50">/..</text>
+        </g>
+        <g>
+            <title>        result = self.take(indices=indices, axis=axis) (74,054 bytes, 2.81%)</title>
+            <rect x="77.2799%" y="672" width="2.8097%" height="21" fill="rgb(255,224,224)" fg:x="2036806" fg:w="74054"/>
+            <text x="77.5299%" y="685.50">..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexing.py:1739 (_getitem_axis) (77,704 bytes, 2.95%)</title>
+            <rect x="77.1741%" y="562" width="2.9482%" height="21" fill="rgb(255,224,224)" fg:x="2034016" fg:w="77704"/>
+            <text x="77.4241%" y="575.50">/..</text>
+        </g>
+        <g>
+            <title>            return self._getbool_axis(key, axis=axis) (77,704 bytes, 2.95%)</title>
+            <rect x="77.1741%" y="584" width="2.9482%" height="21" fill="rgb(255,224,224)" fg:x="2034016" fg:w="77704"/>
+            <text x="77.4241%" y="597.50">..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexing.py:1153 (_getitem_nested_tuple) (500,606 bytes, 18.99%)</title>
+            <rect x="61.1397%" y="518" width="18.9939%" height="21" fill="rgb(255,184,184)" fg:x="1611412" fg:w="500606"/>
+            <text x="61.3897%" y="531.50">/Users/hal/miniforge3/..</text>
+        </g>
+        <g>
+            <title>            obj = getattr(obj, self.name)._getitem_axis(key, axis=axis) (500,606 bytes, 18.99%)</title>
+            <rect x="61.1397%" y="540" width="18.9939%" height="21" fill="rgb(255,184,184)" fg:x="1611412" fg:w="500606"/>
+            <text x="61.3897%" y="553.50">            obj = get..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexing.py:1041 (_getitem_lowerdim) (501,532 bytes, 19.03%)</title>
+            <rect x="61.1397%" y="474" width="19.0290%" height="21" fill="rgb(255,184,184)" fg:x="1611412" fg:w="501532"/>
+            <text x="61.3897%" y="487.50">/Users/hal/miniforge3/..</text>
+        </g>
+        <g>
+            <title>            return self._getitem_nested_tuple(tup) (501,532 bytes, 19.03%)</title>
+            <rect x="61.1397%" y="496" width="19.0290%" height="21" fill="rgb(255,184,184)" fg:x="1611412" fg:w="501532"/>
+            <text x="61.3897%" y="509.50">            return se..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexing.py:1692 (_getitem_tuple) (502,880 bytes, 19.08%)</title>
+            <rect x="61.1310%" y="430" width="19.0801%" height="21" fill="rgb(255,184,184)" fg:x="1611182" fg:w="502880"/>
+            <text x="61.3810%" y="443.50">/Users/hal/miniforge3/..</text>
+        </g>
+        <g>
+            <title>            return self._getitem_lowerdim(tup) (502,880 bytes, 19.08%)</title>
+            <rect x="61.1310%" y="452" width="19.0801%" height="21" fill="rgb(255,184,184)" fg:x="1611182" fg:w="502880"/>
+            <text x="61.3810%" y="465.50">            return se..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/indexing.py:1184 (__getitem__) (505,994 bytes, 19.20%)</title>
+            <rect x="61.0345%" y="386" width="19.1983%" height="21" fill="rgb(255,184,184)" fg:x="1608638" fg:w="505994"/>
+            <text x="61.2845%" y="399.50">/Users/hal/miniforge3/..</text>
+        </g>
+        <g>
+            <title>            return self._getitem_tuple(key) (505,994 bytes, 19.20%)</title>
+            <rect x="61.0345%" y="408" width="19.1983%" height="21" fill="rgb(255,184,184)" fg:x="1608638" fg:w="505994"/>
+            <text x="61.2845%" y="421.50">            return se..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/generic.py:4281 (xs) (585,624 bytes, 22.22%)</title>
+            <rect x="58.0361%" y="342" width="22.2196%" height="21" fill="rgb(255,179,179)" fg:x="1529612" fg:w="585624"/>
+            <text x="58.2861%" y="355.50">/Users/hal/miniforge3/lib/..</text>
+        </g>
+        <g>
+            <title>            result = self.iloc[indexer] (585,624 bytes, 22.22%)</title>
+            <rect x="58.0361%" y="364" width="22.2196%" height="21" fill="rgb(255,179,179)" fg:x="1529612" fg:w="585624"/>
+            <text x="58.2861%" y="377.50">            result = self..</text>
+        </g>
+        <g>
+            <title>/Users/hal/Library/CloudStorage/OneDrive-MMU/Documents/AI_Principles/map_search/search_map_dfs.py:250 (time_between) (1,283,938 bytes, 48.71%)</title>
+            <rect x="31.5737%" y="298" width="48.7148%" height="21" fill="rgb(255,145,145)" fg:x="832164" fg:w="1283938"/>
+            <text x="31.8237%" y="311.50">/Users/hal/Library/CloudStorage/OneDrive-MMU/Documents/AI_P..</text>
+        </g>
+        <g>
+            <title>    edge_between_nodes = gdf_edges.xs(start_node_id, level=&quot;u&quot;).xs(end_node_id, level=&quot;v&quot;) (1,283,938 bytes, 48.71%)</title>
+            <rect x="31.5737%" y="320" width="48.7148%" height="21" fill="rgb(255,145,145)" fg:x="832164" fg:w="1283938"/>
+            <text x="31.8237%" y="333.50">    edge_between_nodes = gdf_edges.xs(start_node_id, level..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/internals/managers.py:1016 (iget) (5,880 bytes, 0.22%)</title>
+            <rect x="80.5679%" y="518" width="0.2231%" height="21" fill="rgb(255,242,242)" fg:x="2123464" fg:w="5880"/>
+            <text x="80.8179%" y="531.50"></text>
+        </g>
+        <g>
+            <title>        block = self.blocks[self.blknos[i]] (5,880 bytes, 0.22%)</title>
+            <rect x="80.5679%" y="540" width="0.2231%" height="21" fill="rgb(255,242,242)" fg:x="2123464" fg:w="5880"/>
+            <text x="80.8179%" y="553.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/internals/managers.py:192 (blknos) (5,880 bytes, 0.22%)</title>
+            <rect x="80.5679%" y="562" width="0.2231%" height="21" fill="rgb(255,242,242)" fg:x="2123464" fg:w="5880"/>
+            <text x="80.8179%" y="575.50"></text>
+        </g>
+        <g>
+            <title>            self._rebuild_blknos_and_blklocs() (5,880 bytes, 0.22%)</title>
+            <rect x="80.5679%" y="584" width="0.2231%" height="21" fill="rgb(255,242,242)" fg:x="2123464" fg:w="5880"/>
+            <text x="80.8179%" y="597.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/internals/base.py:84 (shape) (5,880 bytes, 0.22%)</title>
+            <rect x="80.5679%" y="606" width="0.2231%" height="21" fill="rgb(255,242,242)" fg:x="2123464" fg:w="5880"/>
+            <text x="80.8179%" y="619.50"></text>
+        </g>
+        <g>
+            <title>        return tuple(len(ax) for ax in self.axes) (5,880 bytes, 0.22%)</title>
+            <rect x="80.5679%" y="628" width="0.2231%" height="21" fill="rgb(255,242,242)" fg:x="2123464" fg:w="5880"/>
+            <text x="80.8179%" y="641.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/frame.py:4010 (_ixs) (9,880 bytes, 0.37%)</title>
+            <rect x="80.5679%" y="474" width="0.3749%" height="21" fill="rgb(255,240,240)" fg:x="2123464" fg:w="9880"/>
+            <text x="80.8179%" y="487.50"></text>
+        </g>
+        <g>
+            <title>            col_mgr = self._mgr.iget(i) (9,880 bytes, 0.37%)</title>
+            <rect x="80.5679%" y="496" width="0.3749%" height="21" fill="rgb(255,240,240)" fg:x="2123464" fg:w="9880"/>
+            <text x="80.8179%" y="509.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/frame.py:4078 (__getitem__) (12,472 bytes, 0.47%)</title>
+            <rect x="80.5228%" y="386" width="0.4732%" height="21" fill="rgb(255,239,239)" fg:x="2122276" fg:w="12472"/>
+            <text x="80.7728%" y="399.50"></text>
+        </g>
+        <g>
+            <title>                return self._get_item_cache(key) (12,472 bytes, 0.47%)</title>
+            <rect x="80.5228%" y="408" width="0.4732%" height="21" fill="rgb(255,239,239)" fg:x="2122276" fg:w="12472"/>
+            <text x="80.7728%" y="421.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/pandas/core/frame.py:4639 (_get_item_cache) (11,860 bytes, 0.45%)</title>
+            <rect x="80.5460%" y="430" width="0.4500%" height="21" fill="rgb(255,239,239)" fg:x="2122888" fg:w="11860"/>
+            <text x="80.7960%" y="443.50"></text>
+        </g>
+        <g>
+            <title>            res = self._ixs(loc, axis=1) (11,860 bytes, 0.45%)</title>
+            <rect x="80.5460%" y="452" width="0.4500%" height="21" fill="rgb(255,239,239)" fg:x="2122888" fg:w="11860"/>
+            <text x="80.7960%" y="465.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/geopandas/geodataframe.py:1750 (__getitem__) (13,750 bytes, 0.52%)</title>
+            <rect x="80.4978%" y="342" width="0.5217%" height="21" fill="rgb(255,239,239)" fg:x="2121616" fg:w="13750"/>
+            <text x="80.7478%" y="355.50"></text>
+        </g>
+        <g>
+            <title>        result = super().__getitem__(key) (13,750 bytes, 0.52%)</title>
+            <rect x="80.4978%" y="364" width="0.5217%" height="21" fill="rgb(255,239,239)" fg:x="2121616" fg:w="13750"/>
+            <text x="80.7478%" y="377.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/Library/CloudStorage/OneDrive-MMU/Documents/AI_Principles/map_search/search_map_dfs.py:252 (time_between) (21,380 bytes, 0.81%)</title>
+            <rect x="80.2886%" y="298" width="0.8112%" height="21" fill="rgb(255,236,236)" fg:x="2116102" fg:w="21380"/>
+            <text x="80.5386%" y="311.50"></text>
+        </g>
+        <g>
+            <title>    road_speed_mph = edge_between_nodes[&quot;maxspeed&quot;][0].item() (21,380 bytes, 0.81%)</title>
+            <rect x="80.2886%" y="320" width="0.8112%" height="21" fill="rgb(255,236,236)" fg:x="2116102" fg:w="21380"/>
+            <text x="80.5386%" y="333.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/Library/CloudStorage/OneDrive-MMU/Documents/AI_Principles/map_search/search_map_dfs.py:253 (time_between) (8,794 bytes, 0.33%)</title>
+            <rect x="81.0997%" y="298" width="0.3337%" height="21" fill="rgb(255,241,241)" fg:x="2137482" fg:w="8794"/>
+            <text x="81.3497%" y="311.50"></text>
+        </g>
+        <g>
+            <title>    road_length_m = edge_between_nodes[&quot;length&quot;][0].item() (8,794 bytes, 0.33%)</title>
+            <rect x="81.0997%" y="320" width="0.3337%" height="21" fill="rgb(255,241,241)" fg:x="2137482" fg:w="8794"/>
+            <text x="81.3497%" y="333.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/Library/CloudStorage/OneDrive-MMU/Documents/AI_Principles/map_search/search_map_dfs.py:255 (time_between) (154,632 bytes, 5.87%)</title>
+            <rect x="81.4334%" y="298" width="5.8670%" height="21" fill="rgb(255,213,213)" fg:x="2146276" fg:w="154632"/>
+            <text x="81.6834%" y="311.50">/User..</text>
+        </g>
+        <g>
+            <title>    return road_length_m / mph_to_mps(road_speed_mph) (154,632 bytes, 5.87%)</title>
+            <rect x="81.4334%" y="320" width="5.8670%" height="21" fill="rgb(255,213,213)" fg:x="2146276" fg:w="154632"/>
+            <text x="81.6834%" y="333.50">    ..</text>
+        </g>
+        <g>
+            <title>/Users/hal/Library/CloudStorage/OneDrive-MMU/Documents/AI_Principles/map_search/search_map_dfs.py:243 (mph_to_mps) (154,632 bytes, 5.87%)</title>
+            <rect x="81.4334%" y="342" width="5.8670%" height="21" fill="rgb(255,213,213)" fg:x="2146276" fg:w="154632"/>
+            <text x="81.6834%" y="355.50">/User..</text>
+        </g>
+        <g>
+            <title>    return (speed_mph * 1609.344) / 60**2 (154,632 bytes, 5.87%)</title>
+            <rect x="81.4334%" y="364" width="5.8670%" height="21" fill="rgb(255,213,213)" fg:x="2146276" fg:w="154632"/>
+            <text x="81.6834%" y="377.50">    ..</text>
+        </g>
+        <g>
+            <title>/Users/hal/Library/CloudStorage/OneDrive-MMU/Documents/AI_Principles/map_search/search_map_dfs.py:156 (calc_path_time) (1,472,584 bytes, 55.87%)</title>
+            <rect x="31.5016%" y="254" width="55.8724%" height="21" fill="rgb(255,137,137)" fg:x="830264" fg:w="1472584"/>
+            <text x="31.7516%" y="267.50">/Users/hal/Library/CloudStorage/OneDrive-MMU/Documents/AI_Principles/..</text>
+        </g>
+        <g>
+            <title>        time = np.sum([time_between(path[i], path[i+1]) (1,472,584 bytes, 55.87%)</title>
+            <rect x="31.5016%" y="276" width="55.8724%" height="21" fill="rgb(255,137,137)" fg:x="830264" fg:w="1472584"/>
+            <text x="31.7516%" y="289.50">        time = np.sum([time_between(path[i], path[i+1])..</text>
+        </g>
+        <g>
+            <title>/Users/hal/Library/CloudStorage/OneDrive-MMU/Documents/AI_Principles/map_search/search_map_dfs.py:124 (search_step) (1,627,904 bytes, 61.77%)</title>
+            <rect x="25.6304%" y="210" width="61.7655%" height="21" fill="rgb(255,132,132)" fg:x="675520" fg:w="1627904"/>
+            <text x="25.8804%" y="223.50">/Users/hal/Library/CloudStorage/OneDrive-MMU/Documents/AI_Principles/map_sea..</text>
+        </g>
+        <g>
+            <title>                    cost_to_reach = (next_node.cost_to_reach + self.calc_path_time([next_node.node_id, node_id]) if search_type in [SearchType.UCS, SearchType.A_STAR] else np.nan), (1,627,904 bytes, 61.77%)</title>
+            <rect x="25.6304%" y="232" width="61.7655%" height="21" fill="rgb(255,132,132)" fg:x="675520" fg:w="1627904"/>
+            <text x="25.8804%" y="245.50">                    cost_to_reach = (next_node.cost_to_reach + self.calc_pa..</text>
+        </g>
+        <g>
+            <title>/Users/hal/Library/CloudStorage/OneDrive-MMU/Documents/AI_Principles/map_search/search_map_dfs.py:127 (search_step) (53,024 bytes, 2.01%)</title>
+            <rect x="87.3959%" y="210" width="2.0118%" height="21" fill="rgb(255,228,228)" fg:x="2303424" fg:w="53024"/>
+            <text x="87.6459%" y="223.50"></text>
+        </g>
+        <g>
+            <title>        self.closed.append(next_node) (53,024 bytes, 2.01%)</title>
+            <rect x="87.3959%" y="232" width="2.0118%" height="21" fill="rgb(255,228,228)" fg:x="2303424" fg:w="53024"/>
+            <text x="87.6459%" y="245.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/Library/CloudStorage/OneDrive-MMU/Documents/AI_Principles/map_search/search_map_dfs.py:112 (run_search) (2,356,246 bytes, 89.40%)</title>
+            <rect x="0.0416%" y="166" width="89.4000%" height="21" fill="rgb(255,108,108)" fg:x="1096" fg:w="2356246"/>
+            <text x="0.2916%" y="179.50">/Users/hal/Library/CloudStorage/OneDrive-MMU/Documents/AI_Principles/map_search/search_map_dfs.py:112 (run_sear..</text>
+        </g>
+        <g>
+            <title>            self.search_step(search_type=search_type) (2,356,246 bytes, 89.40%)</title>
+            <rect x="0.0416%" y="188" width="89.4000%" height="21" fill="rgb(255,108,108)" fg:x="1096" fg:w="2356246"/>
+            <text x="0.2916%" y="201.50">            self.search_step(search_type=search_type)</text>
+        </g>
+        <g>
+            <title>/Users/hal/Library/CloudStorage/OneDrive-MMU/Documents/AI_Principles/map_search/search_map_dfs.py:312 (&lt;lambda&gt;) (2,358,122 bytes, 89.47%)</title>
+            <rect x="0.0121%" y="122" width="89.4712%" height="21" fill="rgb(255,108,108)" fg:x="320" fg:w="2358122"/>
+            <text x="0.2621%" y="135.50">/Users/hal/Library/CloudStorage/OneDrive-MMU/Documents/AI_Principles/map_search/search_map_dfs.py:312 (&lt;lambda&gt;)</text>
+        </g>
+        <g>
+            <title>profile(lambda: searcher.run_search(search_type=method), &quot;/tmp/fil-result&quot;) (2,358,122 bytes, 89.47%)</title>
+            <rect x="0.0121%" y="144" width="89.4712%" height="21" fill="rgb(255,108,108)" fg:x="320" fg:w="2358122"/>
+            <text x="0.2621%" y="157.50">profile(lambda: searcher.run_search(search_type=method), &quot;/tmp/fil-result&quot;)</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/filprofiler/_tracer.py:151 (disable_thread_pools) (8,348 bytes, 0.32%)</title>
+            <rect x="89.5114%" y="166" width="0.3167%" height="21" fill="rgb(255,241,241)" fg:x="2359180" fg:w="8348"/>
+            <text x="89.7614%" y="179.50"></text>
+        </g>
+        <g>
+            <title>        from numexpr import set_num_threads as numexpr_set_num_threads (8,348 bytes, 0.32%)</title>
+            <rect x="89.5114%" y="188" width="0.3167%" height="21" fill="rgb(255,241,241)" fg:x="2359180" fg:w="8348"/>
+            <text x="89.7614%" y="201.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/threadpoolctl.py:586 (__init__) (39,703 bytes, 1.51%)</title>
+            <rect x="89.8946%" y="254" width="1.5064%" height="21" fill="rgb(255,231,231)" fg:x="2369280" fg:w="39703"/>
+            <text x="90.1446%" y="267.50"></text>
+        </g>
+        <g>
+            <title>        self._original_info = self._controller.info() (39,703 bytes, 1.51%)</title>
+            <rect x="89.8946%" y="276" width="1.5064%" height="21" fill="rgb(255,231,231)" fg:x="2369280" fg:w="39703"/>
+            <text x="90.1446%" y="289.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/threadpoolctl.py:829 (info) (39,425 bytes, 1.50%)</title>
+            <rect x="89.9051%" y="298" width="1.4959%" height="21" fill="rgb(255,231,231)" fg:x="2369558" fg:w="39425"/>
+            <text x="90.1551%" y="311.50"></text>
+        </g>
+        <g>
+            <title>        return [lib_controller.info() for lib_controller in self.lib_controllers] (39,425 bytes, 1.50%)</title>
+            <rect x="89.9051%" y="320" width="1.4959%" height="21" fill="rgb(255,231,231)" fg:x="2369558" fg:w="39425"/>
+            <text x="90.1551%" y="333.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/threadpoolctl.py:125 (info) (39,217 bytes, 1.49%)</title>
+            <rect x="89.9130%" y="342" width="1.4880%" height="21" fill="rgb(255,231,231)" fg:x="2369766" fg:w="39217"/>
+            <text x="90.1630%" y="355.50"></text>
+        </g>
+        <g>
+            <title>            &quot;num_threads&quot;: self.num_threads, (39,217 bytes, 1.49%)</title>
+            <rect x="89.9130%" y="364" width="1.4880%" height="21" fill="rgb(255,231,231)" fg:x="2369766" fg:w="39217"/>
+            <text x="90.1630%" y="377.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/threadpoolctl.py:138 (num_threads) (39,217 bytes, 1.49%)</title>
+            <rect x="89.9130%" y="386" width="1.4880%" height="21" fill="rgb(255,231,231)" fg:x="2369766" fg:w="39217"/>
+            <text x="90.1630%" y="399.50"></text>
+        </g>
+        <g>
+            <title>        return self.get_num_threads() (39,217 bytes, 1.49%)</title>
+            <rect x="89.9130%" y="408" width="1.4880%" height="21" fill="rgb(255,231,231)" fg:x="2369766" fg:w="39217"/>
+            <text x="90.1630%" y="421.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/threadpoolctl.py:495 (get_num_threads) (39,217 bytes, 1.49%)</title>
+            <rect x="89.9130%" y="430" width="1.4880%" height="21" fill="rgb(255,231,231)" fg:x="2369766" fg:w="39217"/>
+            <text x="90.1630%" y="443.50"></text>
+        </g>
+        <g>
+            <title>        return get_func() (39,217 bytes, 1.49%)</title>
+            <rect x="89.9130%" y="452" width="1.4880%" height="21" fill="rgb(255,231,231)" fg:x="2369766" fg:w="39217"/>
+            <text x="90.1630%" y="465.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/threadpoolctl.py:1227 (_get_libc) (6,374 bytes, 0.24%)</title>
+            <rect x="91.4759%" y="386" width="0.2418%" height="21" fill="rgb(255,242,242)" fg:x="2410959" fg:w="6374"/>
+            <text x="91.7259%" y="399.50"></text>
+        </g>
+        <g>
+            <title>            libc = ctypes.CDLL(find_library(&quot;c&quot;), mode=_RTLD_NOLOAD) (6,374 bytes, 0.24%)</title>
+            <rect x="91.4759%" y="408" width="0.2418%" height="21" fill="rgb(255,242,242)" fg:x="2410959" fg:w="6374"/>
+            <text x="91.7259%" y="421.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/threadpoolctl.py:1024 (_find_libraries_with_dyld) (7,296 bytes, 0.28%)</title>
+            <rect x="91.4759%" y="342" width="0.2768%" height="21" fill="rgb(255,242,242)" fg:x="2410959" fg:w="7296"/>
+            <text x="91.7259%" y="355.50"></text>
+        </g>
+        <g>
+            <title>        libc = self._get_libc() (7,296 bytes, 0.28%)</title>
+            <rect x="91.4759%" y="364" width="0.2768%" height="21" fill="rgb(255,242,242)" fg:x="2410959" fg:w="7296"/>
+            <text x="91.7259%" y="377.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/threadpoolctl.py:1037 (_find_libraries_with_dyld) (69,204 bytes, 2.63%)</title>
+            <rect x="91.7874%" y="342" width="2.6257%" height="21" fill="rgb(255,225,225)" fg:x="2419167" fg:w="69204"/>
+            <text x="92.0374%" y="355.50">/..</text>
+        </g>
+        <g>
+            <title>            filepath = filepath.decode(&quot;utf-8&quot;) (69,204 bytes, 2.63%)</title>
+            <rect x="91.7874%" y="364" width="2.6257%" height="21" fill="rgb(255,225,225)" fg:x="2419167" fg:w="69204"/>
+            <text x="92.0374%" y="377.50">..</text>
+        </g>
+        <g>
+            <title>&lt;frozen posixpath&gt;:428 (realpath) (69,204 bytes, 2.63%)</title>
+            <rect x="96.1900%" y="474" width="2.6257%" height="21" fill="rgb(255,225,225)" fg:x="2535205" fg:w="69204"/>
+            <text x="96.4400%" y="487.50">&lt;..</text>
+        </g>
+        <g>
+            <title> (69,204 bytes, 2.63%)</title>
+            <rect x="96.1900%" y="496" width="2.6257%" height="21" fill="rgb(255,225,225)" fg:x="2535205" fg:w="69204"/>
+            <text x="96.4400%" y="509.50">..</text>
+        </g>
+        <g>
+            <title>&lt;frozen posixpath&gt;:417 (abspath) (69,204 bytes, 2.63%)</title>
+            <rect x="96.1900%" y="518" width="2.6257%" height="21" fill="rgb(255,225,225)" fg:x="2535205" fg:w="69204"/>
+            <text x="96.4400%" y="531.50">&lt;..</text>
+        </g>
+        <g>
+            <title> (69,204 bytes, 2.63%)</title>
+            <rect x="96.1900%" y="540" width="2.6257%" height="21" fill="rgb(255,225,225)" fg:x="2535205" fg:w="69204"/>
+            <text x="96.4400%" y="553.50">..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/threadpoolctl.py:1134 (_make_controller_from_path) (116,462 bytes, 4.42%)</title>
+            <rect x="94.4256%" y="386" width="4.4188%" height="21" fill="rgb(255,218,218)" fg:x="2488701" fg:w="116462"/>
+            <text x="94.6756%" y="399.50">/Us..</text>
+        </g>
+        <g>
+            <title>        filepath = _realpath(filepath) (116,462 bytes, 4.42%)</title>
+            <rect x="94.4256%" y="408" width="4.4188%" height="21" fill="rgb(255,218,218)" fg:x="2488701" fg:w="116462"/>
+            <text x="94.6756%" y="421.50">  ..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/threadpoolctl.py:548 (_realpath) (70,460 bytes, 2.67%)</title>
+            <rect x="96.1710%" y="430" width="2.6734%" height="21" fill="rgb(255,225,225)" fg:x="2534703" fg:w="70460"/>
+            <text x="96.4210%" y="443.50">/..</text>
+        </g>
+        <g>
+            <title>    return os.path.realpath(filepath) (70,460 bytes, 2.67%)</title>
+            <rect x="96.1710%" y="452" width="2.6734%" height="21" fill="rgb(255,225,225)" fg:x="2534703" fg:w="70460"/>
+            <text x="96.4210%" y="465.50">..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/threadpoolctl.py:1040 (_find_libraries_with_dyld) (120,276 bytes, 4.56%)</title>
+            <rect x="94.4131%" y="342" width="4.5635%" height="21" fill="rgb(255,217,217)" fg:x="2488371" fg:w="120276"/>
+            <text x="94.6631%" y="355.50">/Us..</text>
+        </g>
+        <g>
+            <title>            self._make_controller_from_path(filepath) (120,276 bytes, 4.56%)</title>
+            <rect x="94.4131%" y="364" width="4.5635%" height="21" fill="rgb(255,217,217)" fg:x="2488371" fg:w="120276"/>
+            <text x="94.6631%" y="377.50">  ..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/threadpoolctl.py:818 (__init__) (199,314 bytes, 7.56%)</title>
+            <rect x="91.4581%" y="254" width="7.5623%" height="21" fill="rgb(255,208,208)" fg:x="2410489" fg:w="199314"/>
+            <text x="91.7081%" y="267.50">/Users/..</text>
+        </g>
+        <g>
+            <title>        self._load_libraries() (199,314 bytes, 7.56%)</title>
+            <rect x="91.4581%" y="276" width="7.5623%" height="21" fill="rgb(255,208,208)" fg:x="2410489" fg:w="199314"/>
+            <text x="91.7081%" y="289.50">      ..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/threadpoolctl.py:970 (_load_libraries) (198,844 bytes, 7.54%)</title>
+            <rect x="91.4759%" y="298" width="7.5445%" height="21" fill="rgb(255,208,208)" fg:x="2410959" fg:w="198844"/>
+            <text x="91.7259%" y="311.50">/Users/..</text>
+        </g>
+        <g>
+            <title>            self._find_libraries_with_dyld() (198,844 bytes, 7.54%)</title>
+            <rect x="91.4759%" y="320" width="7.5445%" height="21" fill="rgb(255,208,208)" fg:x="2410959" fg:w="198844"/>
+            <text x="91.7259%" y="333.50">      ..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/re/_compiler.py:745 (compile) (10,118 bytes, 0.38%)</title>
+            <rect x="99.0931%" y="474" width="0.3839%" height="21" fill="rgb(255,240,240)" fg:x="2611719" fg:w="10118"/>
+            <text x="99.3431%" y="487.50"></text>
+        </g>
+        <g>
+            <title>        p = _parser.parse(p, flags) (10,118 bytes, 0.38%)</title>
+            <rect x="99.0931%" y="496" width="0.3839%" height="21" fill="rgb(255,240,240)" fg:x="2611719" fg:w="10118"/>
+            <text x="99.3431%" y="509.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/re/_parser.py:979 (parse) (8,292 bytes, 0.31%)</title>
+            <rect x="99.1624%" y="518" width="0.3146%" height="21" fill="rgb(255,241,241)" fg:x="2613545" fg:w="8292"/>
+            <text x="99.4124%" y="531.50"></text>
+        </g>
+        <g>
+            <title>    p = _parse_sub(source, state, flags &amp; SRE_FLAG_VERBOSE, 0) (8,292 bytes, 0.31%)</title>
+            <rect x="99.1624%" y="540" width="0.3146%" height="21" fill="rgb(255,241,241)" fg:x="2613545" fg:w="8292"/>
+            <text x="99.4124%" y="553.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/re/_parser.py:512 (_parse_sub) (6,870 bytes, 0.26%)</title>
+            <rect x="99.2164%" y="562" width="0.2607%" height="21" fill="rgb(255,242,242)" fg:x="2614967" fg:w="6870"/>
+            <text x="99.4664%" y="575.50"></text>
+        </g>
+        <g>
+            <title>def _parse(source, state, verbose, nested, first=False): (6,870 bytes, 0.26%)</title>
+            <rect x="99.2164%" y="584" width="0.2607%" height="21" fill="rgb(255,242,242)" fg:x="2614967" fg:w="6870"/>
+            <text x="99.4664%" y="597.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/re/_compiler.py:749 (compile) (7,012 bytes, 0.27%)</title>
+            <rect x="99.4770%" y="474" width="0.2660%" height="21" fill="rgb(255,242,242)" fg:x="2621837" fg:w="7012"/>
+            <text x="99.7270%" y="487.50"></text>
+        </g>
+        <g>
+            <title>    code = _code(p, flags) (7,012 bytes, 0.27%)</title>
+            <rect x="99.4770%" y="496" width="0.2660%" height="21" fill="rgb(255,242,242)" fg:x="2621837" fg:w="7012"/>
+            <text x="99.7270%" y="509.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/re/__init__.py:307 (_compile) (18,264 bytes, 0.69%)</title>
+            <rect x="99.0832%" y="430" width="0.6930%" height="21" fill="rgb(255,237,237)" fg:x="2611457" fg:w="18264"/>
+            <text x="99.3332%" y="443.50"></text>
+        </g>
+        <g>
+            <title>        p = _compiler.compile(pattern, flags) (18,264 bytes, 0.69%)</title>
+            <rect x="99.0832%" y="452" width="0.6930%" height="21" fill="rgb(255,237,237)" fg:x="2611457" fg:w="18264"/>
+            <text x="99.3332%" y="465.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/re/__init__.py:186 (sub) (20,484 bytes, 0.78%)</title>
+            <rect x="99.0204%" y="386" width="0.7772%" height="21" fill="rgb(255,236,236)" fg:x="2609803" fg:w="20484"/>
+            <text x="99.2704%" y="399.50"></text>
+        </g>
+        <g>
+            <title>    return _compile(pattern, flags).sub(repl, string, count) (20,484 bytes, 0.78%)</title>
+            <rect x="99.0204%" y="408" width="0.7772%" height="21" fill="rgb(255,236,236)" fg:x="2609803" fg:w="20484"/>
+            <text x="99.2704%" y="421.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/threadpoolctl.py:1202 (_warn_if_incompatible_openmp) (21,398 bytes, 0.81%)</title>
+            <rect x="99.0204%" y="298" width="0.8119%" height="21" fill="rgb(255,236,236)" fg:x="2609803" fg:w="21398"/>
+            <text x="99.2704%" y="311.50"></text>
+        </g>
+        <g>
+            <title>        msg = textwrap.dedent( (21,398 bytes, 0.81%)</title>
+            <rect x="99.0204%" y="320" width="0.8119%" height="21" fill="rgb(255,236,236)" fg:x="2609803" fg:w="21398"/>
+            <text x="99.2704%" y="333.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/textwrap.py:466 (dedent) (21,398 bytes, 0.81%)</title>
+            <rect x="99.0204%" y="342" width="0.8119%" height="21" fill="rgb(255,236,236)" fg:x="2609803" fg:w="21398"/>
+            <text x="99.2704%" y="355.50"></text>
+        </g>
+        <g>
+            <title>        text = re.sub(r&apos;(?m)^&apos; + margin, &apos;&apos;, text) (21,398 bytes, 0.81%)</title>
+            <rect x="99.0204%" y="364" width="0.8119%" height="21" fill="rgb(255,236,236)" fg:x="2609803" fg:w="21398"/>
+            <text x="99.2704%" y="377.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/threadpoolctl.py:819 (__init__) (21,828 bytes, 0.83%)</title>
+            <rect x="99.0204%" y="254" width="0.8282%" height="21" fill="rgb(255,236,236)" fg:x="2609803" fg:w="21828"/>
+            <text x="99.2704%" y="267.50"></text>
+        </g>
+        <g>
+            <title>        self._warn_if_incompatible_openmp() (21,828 bytes, 0.83%)</title>
+            <rect x="99.0204%" y="276" width="0.8282%" height="21" fill="rgb(255,236,236)" fg:x="2609803" fg:w="21828"/>
+            <text x="99.2704%" y="289.50"></text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/contextlib.py:137 (__enter__) (273,279 bytes, 10.37%)</title>
+            <rect x="89.4928%" y="122" width="10.3687%" height="21" fill="rgb(255,201,201)" fg:x="2358690" fg:w="273279"/>
+            <text x="89.7428%" y="135.50">/Users/hal/..</text>
+        </g>
+        <g>
+            <title>            return next(self.gen) (273,279 bytes, 10.37%)</title>
+            <rect x="89.4928%" y="144" width="10.3687%" height="21" fill="rgb(255,201,201)" fg:x="2358690" fg:w="273279"/>
+            <text x="89.7428%" y="157.50">          ..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/filprofiler/_tracer.py:179 (disable_thread_pools) (263,937 bytes, 10.01%)</title>
+            <rect x="89.8472%" y="166" width="10.0142%" height="21" fill="rgb(255,202,202)" fg:x="2368032" fg:w="263937"/>
+            <text x="90.0972%" y="179.50">/Users/hal..</text>
+        </g>
+        <g>
+            <title>    with threadpoolctl.threadpool_limits({&quot;blas&quot;: 1, &quot;openmp&quot;: 1}): (263,937 bytes, 10.01%)</title>
+            <rect x="89.8472%" y="188" width="10.0142%" height="21" fill="rgb(255,202,202)" fg:x="2368032" fg:w="263937"/>
+            <text x="90.0972%" y="201.50">    with ..</text>
+        </g>
+        <g>
+            <title>/Users/hal/miniforge3/lib/python3.12/site-packages/threadpoolctl.py:794 (__init__) (263,287 bytes, 9.99%)</title>
+            <rect x="89.8719%" y="210" width="9.9896%" height="21" fill="rgb(255,202,202)" fg:x="2368682" fg:w="263287"/>
+            <text x="90.1219%" y="223.50">/Users/hal..</text>
+        </g>
+        <g>
+            <title>        super().__init__(ThreadpoolController(), limits=limits, user_api=user_api) (263,287 bytes, 9.99%)</title>
+            <rect x="89.8719%" y="232" width="9.9896%" height="21" fill="rgb(255,202,202)" fg:x="2368682" fg:w="263287"/>
+            <text x="90.1219%" y="245.50">        s..</text>
+        </g>
+        <g>
+            <title>all (2,635,621 bytes, 100%)</title>
+            <rect x="0.0000%" y="100" width="100.0000%" height="21" fill="rgb(255,100,100)" fg:x="0" fg:w="2635621"/>
+            <text x="0.2500%" y="113.50"></text>
+        </g>
+    </svg>
+</svg>
