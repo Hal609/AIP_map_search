@@ -8,10 +8,9 @@
 | Uniform Cost Search (**UCS**) | ✅ |
 | A Search (**A\***) | ✅ |
 
-## 2. Tree Search and Graph Search
+## 2. Search
 
-- Tree Search: Explore all nodes without checking if a node has been visited before.
-- Graph Search: Use a closed set to track visited nodes and avoid revisiting. ✅
+- Search: Use a closed set to track visited nodes and avoid revisiting. ✅
 - If a node is already visited, check if a faster path to the node has been found and update accordingly.
 - Record the following for each version:
     - Path found ✅
